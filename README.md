@@ -84,6 +84,8 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 
 每个稳定分组一份 JSON，每轮只追加新内容，已记录的请求历史和工具事件不反复写入。正常追加只替换文件结尾的数组/对象闭合符，保留此前轮次的字节，不整体覆盖累计文档。首次创建和中断修复使用临时文件原子替换。响应结束或中断后落盘，不是每个 token 立即写入；追加的短暂窗口内，外部读取者可能读到未闭合尾部，稍后重读即可。
 
+CRC32 只取 system 与首条 user 的实际内容，忽略内容块上的 `cache_control` 缓存元数据；缓存标记增加、移除或移动不会创建新分组，原始请求仍完整保留。OMP 自动生成标题等独立提示词请求使用自己的分组，因此一次 OMP 运行可能包含主对话 JSON 和标题 JSON。GET/HEAD/OPTIONS 等请求若不含对话、思考或工具事件（例如 `GET /usages` 额度查询），只保存在内部审计证据中，不再生成空会话 JSON。
+
 优先通过真实 response ID / previous_response_id 关联已有分组；无法关联时使用 system + 首条 user 的 CRC32，例如 `session-crc32-1a2b3c4d-rl.json`。已有响应链沿用原文件，无初始上下文时使用带 response ID 的文件名。每轮新 response ID 不会强制新建文件。SHA-256 校验锚点，防止 CRC32 碰撞误合并；相同初始上下文仍只是分组线索，不是独立运行/分支的严格身份。请求 ID 不冒充响应 ID。
 
 直接读取用户可见 JSON：
@@ -213,6 +215,8 @@ Launcher output defaults to `audit-logs/<run-id>/` beside the script. The Window
 - `.audit-state/` holds internal incremental evidence and locks for exact exchange recovery, restart deduplication and crash repair. It uses JSONL deltas internally, without storing a full conversation snapshot on every turn.
 
 Each group has one JSON document. Only new content and unique tool events are appended. Normal appends replace the closing array/object footer and preserve earlier turn bytes; they do not rewrite the entire accumulated document. First creation and interrupted-write repair use atomic temporary-file replacement. Writes occur at response completion/interruption, not after each token. External readers may briefly observe an incomplete footer during append and should retry.
+
+CRC32 uses system and first-user content, ignoring `cache_control` metadata on content blocks. Adding, removing or moving cache hints does not create a new group; raw requests remain intact. Independent OMP prompts such as automatic title generation have their own groups, so one OMP run may produce a main-conversation JSON and a title JSON. GET/HEAD/OPTIONS requests without conversation content, reasoning or tool events (such as `GET /usages` quota checks) remain in internal evidence without generating empty conversation JSON files.
 
 Known response IDs or previous_response_id link existing groups; otherwise the system and first user form a CRC32 anchor, e.g. `session-crc32-1a2b3c4d-rl.json`. Linked responses keep their original group file; without initial context the filename contains the response ID. A fresh response ID alone does not force a new file. SHA-256 disambiguates CRC32 collisions. Identical initial prompts remain grouping hints, not strict independent-session or branch identities. Request IDs are never treated as response IDs.
 

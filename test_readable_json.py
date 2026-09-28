@@ -110,6 +110,85 @@ def run_checks(directory_parent=None):
         checks.append(("readable_export_failure_preserves_durable_thinking",
                        json.loads(repaired.read_text(encoding="utf-8"))["turns"][0]["thinking"] == first["chatml"]["messages"][-1]["thinking"]))
 
+        cache_dir = root / "cache-hints"
+        cache_writer = ap.SessionJsonWriter(str(cache_dir))
+        cached_messages = [{"role": "user", "content": [
+            {"type": "text", "text": "fixture reminder"},
+            {"type": "text", "text": "CACHE_PROMPT_SENTINEL", "cache_control": {"type": "ephemeral"}}]}]
+        cached_system = [{"type": "text", "text": "fixture system"}]
+        cached_first = exchange("cache-a", cached_messages, "cache thought", call=True, system=cached_system)
+        original_body = copy.deepcopy(cached_first["request"]["body"])
+        cache_path = Path(cache_writer.write(cached_first))
+        cached_bytes = cache_path.read_bytes()
+        moved_messages = copy.deepcopy(cached_messages)
+        del moved_messages[0]["content"][1]["cache_control"]
+        moved_messages += [{"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "cache thought"},
+            {"type": "tool_use", "id": "call1", "name": "mcp__fixture_read", "input": {"path": "file.txt"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call1",
+                                           "content": "工具返回全文\nsecond line", "cache_control": {"type": "ephemeral"}}]}]
+        moved_system = [{**cached_system[0], "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+        cached_second = exchange("cache-b", moved_messages, "next thought", "answer", result=True, system=moved_system)
+        next_path = Path(ap.SessionJsonWriter(str(cache_dir)).write(cached_second))
+        cache_doc = json.loads(next_path.read_text(encoding="utf-8"))
+        checks.append(("readable_cache_hint_movement_does_not_split_conversation", cache_path == next_path
+                       and len(list(cache_dir.glob("session-*-rl.json"))) == 1 and len(cache_doc["turns"]) == 2))
+        checks.append(("readable_cache_hint_change_keeps_incremental_append", next_path.read_bytes().startswith(
+                       cached_bytes[:-len(cache_writer.FOOTER)]) and not cache_doc["turns"][1]["input_messages"]
+                       and not cache_doc["turns"][1]["tool_calls"]))
+        checks.append(("readable_cache_hints_remain_intact_in_raw_evidence",
+                       cached_first["request"]["body"] == original_body
+                       and [record["request"]["body"] for record in ap.iter_session_records(str(cache_dir))]
+                       == [cached_first["request"]["body"], cached_second["request"]["body"]]))
+
+        semantic = copy.deepcopy(original_body)
+        semantic["messages"][0]["content"][1]["text"] += " changed"
+        nested_a = {"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"cache_control": "actual payload A"}}]}]}
+        nested_b = copy.deepcopy(nested_a)
+        nested_b["messages"][0]["content"][0]["source"]["cache_control"] = "actual payload B"
+        checks.append(("context_normalization_preserves_real_text_and_nested_payload_changes",
+                       ap.initial_context("anthropic-messages", semantic) != ap.initial_context("anthropic-messages", original_body)
+                       and ap.initial_context("anthropic-messages", nested_a) != ap.initial_context("anthropic-messages", nested_b)))
+
+        legacy_dir = root / "legacy-cache-hints"
+        normalized_context = ap.initial_context
+        def legacy_context(protocol, body):
+            if protocol != "anthropic-messages":
+                return normalized_context(protocol, body)
+            return {"system": body.get("system"), "first_user": next(
+                (message.get("content") for message in body.get("messages", []) if message.get("role") == "user"), None)}
+        with patch.object(ap, "initial_context", side_effect=legacy_context):
+            legacy_path = Path(ap.SessionJsonWriter(str(legacy_dir)).write(copy.deepcopy(cached_first)))
+        legacy_bytes = legacy_path.read_bytes()
+        resumed_path = Path(ap.SessionJsonWriter(str(legacy_dir)).write(copy.deepcopy(cached_second)))
+        checks.append(("readable_restart_reuses_legacy_cached_anchor_filename", resumed_path == legacy_path
+                       and resumed_path.read_bytes().startswith(legacy_bytes[:-len(cache_writer.FOOTER)])
+                       and len(json.loads(resumed_path.read_text(encoding="utf-8"))["turns"]) == 2))
+
+        metadata_dir = root / "http-metadata"
+        metadata = {"exchange_id": "usage-query", "method": "GET", "path": "/usages",
+                    "protocol": "openai-completions", "request": {"body_bytes": 0},
+                    "response": {"status": 200, "body": {"usages": {"remaining": 10}}},
+                    "chatml": {"messages": [{"role": "assistant", "content": None, "thinking": None}]},
+                    "tool_trace": []}
+        metadata_writer = ap.SessionJsonWriter(str(metadata_dir))
+        evidence_path = Path(metadata_writer.write(metadata))
+        checks.append(("usage_queries_do_not_create_empty_public_json", not list(metadata_dir.glob("*.json"))
+                       and evidence_path.parent == metadata_dir / ".audit-state"))
+        replayed_metadata = list(ap.iter_session_records(str(metadata_dir)))
+        checks.append(("usage_query_response_is_preserved_in_internal_evidence", len(replayed_metadata) == 1
+                       and replayed_metadata[0]["response"] == metadata["response"]))
+        ap.SessionJsonWriter(str(metadata_dir)).write(copy.deepcopy(metadata))
+        checks.append(("usage_query_restart_does_not_recreate_empty_public_json", not list(metadata_dir.glob("*.json"))
+                       and len(list(ap.iter_session_records(str(metadata_dir)))) == 1))
+        get_conversation = copy.deepcopy(first)
+        get_conversation["exchange_id"], get_conversation["method"] = "get-with-content", "GET"
+        get_path = Path(metadata_writer.write(get_conversation))
+        checks.append(("get_with_actual_reasoning_or_tools_is_not_filtered", get_path.suffix == ".json"
+                       and json.loads(get_path.read_text(encoding="utf-8"))["turns"][0]["thinking"]
+                       == first["chatml"]["messages"][-1]["thinking"]))
+
         growth_dir = root / "growth"
         growth = ap.SessionJsonWriter(str(growth_dir))
         history = [{"role": "user", "content": "LONG_PROMPT_SENTINEL" + "X" * 50000}]

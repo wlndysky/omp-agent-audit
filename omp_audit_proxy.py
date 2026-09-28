@@ -458,6 +458,13 @@ class DeltaJournalWriter:
             self.responses[(frame["scope"], frame["response_id"])] = stream
         if frame.get("context_sha256"):
             self.contexts[(frame["context_crc32"], frame["context_sha256"])] = stream
+            # Older journals included transient cache hints in their identity.
+            # Restore a normalized alias without renaming or rewriting evidence.
+            anchor = initial_context(state["protocol"], state["request"].get("body"))
+            if anchor is not None:
+                encoded = _canon(anchor).encode("utf-8")
+                normalized = (f"{zlib.crc32(encoded):08x}", hashlib.sha256(encoded).hexdigest())
+                self.contexts.setdefault(normalized, stream)
         self.frames += 1
 
     def _sync(self):
@@ -575,6 +582,11 @@ class SessionJsonWriter:
         return session_filename(stream)[:-1]  # .json, not .jsonl
 
     def _make_turn(self, record, frame):
+        messages = (record.get("chatml") or {}).get("messages", [])
+        if (record.get("method") in ("GET", "HEAD", "OPTIONS") and not record.get("tool_trace")
+                and not any(message.get("content") or message.get("thinking") or message.get("tool_calls")
+                            or message.get("tool_results") for message in messages)):
+            return None  # Usage/model metadata remains in evidence, not an empty conversation JSON.
         stream = frame["stream_id"]
         message_keys = self.messages_seen.setdefault(stream, set())
         call_keys = self.calls_seen.setdefault(stream, set())
@@ -689,14 +701,16 @@ class SessionJsonWriter:
                 state = apply_json_delta(self.raw_states.get(stream, {}), frame["changes"])
                 if hashlib.sha256(_canon(state).encode()).hexdigest() != frame["state_sha256"]:
                     raise ValueError("Internal evidence checksum mismatch")
-                document = self.documents.setdefault(stream, {"schema_version": 3, "stream_id": stream,
-                    "grouped_by": frame["grouped_by"], "context_crc32": frame.get("context_crc32"),
-                    "description": "New conversation content only; thinking and tool payloads are directly readable.",
-                    "turns": []})
-                document["turns"].append(self._make_turn(state, frame))
+                turn = self._make_turn(state, frame)
+                if turn is not None:
+                    document = self.documents.setdefault(stream, {"schema_version": 3, "stream_id": stream,
+                        "grouped_by": frame["grouped_by"], "context_crc32": frame.get("context_crc32"),
+                        "description": "New conversation content only; thinking and tool payloads are directly readable.",
+                        "turns": []})
+                    document["turns"].append(turn)
+                    self.dirty.add(stream)
                 self.raw_states[stream], self.heads[stream] = state, frame["exchange_id"]
                 self.offsets[path] = self.offsets.get(path, 0) + length
-                self.dirty.add(stream)
         for stream in list(self.dirty):
             self._write_document(stream)
             self.dirty.remove(stream)
@@ -707,6 +721,10 @@ class SessionJsonWriter:
         with self.lock, _session_file_lock(os.path.join(self.journal.directory, "readable-json.lock")):
             internal = self.journal.write(record)
             self._sync()
+            if record["stream_id"] not in self.documents:
+                self.path = internal
+                record["session_file"] = os.path.relpath(internal, self.directory)
+                return self.path
             name = os.path.basename(internal)[:-1]
             self.path = os.path.join(self.directory, name)
             record["session_file"] = name
@@ -771,17 +789,25 @@ def _canon(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _context_content(content):
+    """Ignore provider cache hints on content blocks, preserving actual payloads."""
+    if isinstance(content, list):
+        return [{key: value for key, value in block.items() if key != "cache_control"}
+                if isinstance(block, dict) else block for block in content]
+    return content
+
+
 def initial_context(protocol: str, body):
-    """Keep the exact system and first-user anchor, excluding later history."""
+    """Anchor on system and first-user content, excluding transient cache hints."""
     if not isinstance(body, dict):
         return None
     system = None
     first_user = None
     if protocol == "anthropic-messages":
-        system = body.get("system")
+        system = _context_content(body.get("system"))
         for m in body.get("messages") or []:
             if isinstance(m, dict) and m.get("role") == "user":
-                first_user = m.get("content")
+                first_user = _context_content(m.get("content"))
                 break
     else:  # openai-completions / openai-responses / unknown 按 openai 形尝试
         msgs = body.get("messages") or body.get("input") or []
@@ -790,14 +816,14 @@ def initial_context(protocol: str, body):
             msgs = []
         sys_parts = []
         if body.get("instructions"):
-            sys_parts.append(body["instructions"])
+            sys_parts.append(_context_content(body["instructions"]))
         for m in msgs:
             if not isinstance(m, dict):
                 continue
             if m.get("role") in ("system", "developer"):
-                sys_parts.append(m.get("content"))
+                sys_parts.append(_context_content(m.get("content")))
             if m.get("role") == "user":
-                first_user = m.get("content")
+                first_user = _context_content(m.get("content"))
                 break
         system = sys_parts if sys_parts else None
     if system is None and first_user is None:
