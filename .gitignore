@@ -1,0 +1,36 @@
+# Runtime evidence must not be published.
+audit-logs/
+logs/
+*.jsonl
+*.jsonl.*
+*.log
+*.log.*
+
+# Local credentials and agent configuration.
+.env
+.env.*
+!.env.example
+*.local.json
+*.local.yml
+*.local.yaml
+models.yml
+models.yaml
+auth.json
+mcp.json
+settings.yml
+settings.yaml
+*.pem
+*.key
+
+# Python and editor artifacts.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
