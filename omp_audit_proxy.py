@@ -87,12 +87,29 @@ CONTROL_PATH = "/__audit/routes"
 SUPPORTED_APIS = {"anthropic-messages", "openai-completions", "openai-responses"}
 
 # Written only into a temporary local directory; never installed into OMP.
-# Runtime registration changes this process's model registry, not models.yml.
+# Redirect fetch at the HTTP boundary. Never put ephemeral URLs into OMP's
+# registry: background discovery can persist those URLs into models.db.
 LAUNCHER_EXTENSION = r'''
 export default function (pi) {
   const root = process.env.OMP_AUDIT_CONTROL_URL;
   const token = process.env.OMP_AUDIT_CONTROL_TOKEN;
   const supported = new Set(["anthropic-messages", "openai-completions", "openai-responses"]);
+  const originalFetch = globalThis.fetch;
+  let destinations = [];
+  globalThis.fetch = new Proxy(originalFetch, {
+    apply(target, receiver, args) {
+      const [input, init] = args;
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const route = destinations.find(r => url.origin === r.origin &&
+        (url.pathname === r.path || url.pathname.startsWith(r.path + "/")));
+      if (!route) return Reflect.apply(target, receiver, args);
+      // Keep the entire original path suffix (including its leading slash).
+      // Do not rebuild headers/options: this preserves auth, abort and streams.
+      const local = route.local + "/" + url.pathname.slice(route.path.length) + url.search;
+      const forwarded = input instanceof Request ? new Request(local, input) : local;
+      return Reflect.apply(target, receiver, [forwarded, init]);
+    },
+  });
   pi.on("session_start", async (_event, ctx) => {
     try {
       if (!root || !token) throw new Error("Missing private launcher connection");
@@ -103,19 +120,31 @@ export default function (pi) {
         grouped.set(model.provider, group);
       }
       const entries = [];
+      const reasons = new Map();
       let skipped = 0;
       for (const [provider, models] of grouped) {
         const endpoints = new Set(models.map(m => JSON.stringify([m.api, m.baseUrl])));
         const model = models[0];
-        if (endpoints.size !== 1 || !supported.has(model.api) || !model.baseUrl) {
+        const stale = models.some(m => /^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+\/_audit\//.test(m.baseUrl || ""));
+        if (stale) {
           skipped++;
+          reasons.set(provider, "stale audit URL in model cache; restore the verified original endpoint");
           continue;
         }
-        // Parent-prepared child registries may already carry these overrides.
-        if (model.baseUrl.startsWith(root + "/_audit/")) continue;
-        entries.push({provider, api: model.api, upstream: model.baseUrl});
+        if (endpoints.size !== 1 || !supported.has(model.api) || !model.baseUrl) {
+          skipped++;
+          reasons.set(provider, endpoints.size !== 1 ? "mixed model endpoints/APIs" :
+            !model.baseUrl ? "missing base URL" : "unsupported API " + model.api);
+          continue;
+        }
+        entries.push({provider, api: model.api, upstream: model.baseUrl, exact_path: true});
       }
-      const response = await fetch(root + "/__audit/routes", {
+      if (ctx.model && !entries.some(r => r.provider === ctx.model.provider)) {
+        throw new Error("The selected provider cannot be safely auto-routed: " +
+          ctx.model.provider + "/" + ctx.model.id + " (" +
+          (reasons.get(ctx.model.provider) || "model absent from catalog") + ")");
+      }
+      const response = await originalFetch(root + "/__audit/routes", {
         method: "POST",
         headers: {"Content-Type": "application/json", "Authorization": "Bearer " + token},
         body: JSON.stringify({routes: entries}),
@@ -123,17 +152,14 @@ export default function (pi) {
       });
       if (!response.ok) throw new Error("Audit route registration failed: " + response.status);
       const payload = await response.json();
-      for (const route of payload.routes) {
-        pi.registerProvider(route.provider, {baseUrl: route.baseUrl});
-      }
-      if (ctx.model) {
-        const routed = ctx.modelRegistry.find(ctx.model.provider, ctx.model.id);
-        if (!routed || !routed.baseUrl.startsWith(root + "/_audit/")) {
-          throw new Error("The selected provider cannot be safely auto-routed; use an explicit route instead");
-        }
-        if (!(await pi.setModel(routed))) throw new Error("Unable to activate the routed model");
-      }
-      const ready = await fetch(root + "/__audit/routes", {
+      destinations = payload.routes.map(route => {
+        const entry = entries.find(e => e.provider === route.provider);
+        if (!entry) throw new Error("Unexpected audit route registration");
+        const upstream = new URL(entry.upstream);
+        return {origin: upstream.origin, path: upstream.pathname.replace(/\/+$/, ""), local: route.baseUrl};
+      }).sort((a, b) => b.path.length - a.path.length);
+      if (destinations.length !== entries.length) throw new Error("Incomplete audit route registration");
+      const ready = await originalFetch(root + "/__audit/routes", {
         method: "POST",
         headers: {"Content-Type": "application/json", "Authorization": "Bearer " + token},
         body: JSON.stringify({routes: [], ready: true}),
@@ -1396,7 +1422,9 @@ class SseTap:
 
 
 class Route:
-    def __init__(self, prefix: str, upstream: str, hint: str, *, automatic: bool = False):
+    def __init__(self, prefix: str, upstream: str, hint: str, *, automatic: bool = False,
+                 exact_path: bool = False):
+        self.exact_path = exact_path
         self.prefix = prefix
         self.upstream = upstream.rstrip("/")
         self.hint = hint
@@ -1561,6 +1589,9 @@ class AuditHandler(BaseHTTPRequestHandler):
                 if not isinstance(entry, dict):
                     raise ValueError("Invalid route entry")
                 provider, api, upstream = (entry.get(k) for k in ("provider", "api", "upstream"))
+                exact_path = entry.get("exact_path", False)
+                if not isinstance(exact_path, bool):
+                    raise ValueError("Invalid path mode")
                 if not isinstance(provider, str) or not provider or provider in providers:
                     raise ValueError("Missing or duplicate provider")
                 if api not in SUPPORTED_APIS or not isinstance(upstream, str):
@@ -1569,7 +1600,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 # model URL: its client appends /v1/messages to the local URL.
                 # This is launcher-only; explicit --route paths stay literal.
                 upstream = upstream.strip().rstrip("/")
-                if api == "anthropic-messages" and upstream.endswith("/v1"):
+                if not exact_path and api == "anthropic-messages" and upstream.endswith("/v1"):
                     upstream = upstream[:-3]
                 parsed = urllib.parse.urlsplit(upstream)
                 if (parsed.scheme not in ("http", "https") or not parsed.hostname
@@ -1577,10 +1608,13 @@ class AuditHandler(BaseHTTPRequestHandler):
                     raise ValueError("Upstream must be an HTTP(S) base URL without credentials, query or fragment")
                 if parsed.hostname in ("localhost", "127.0.0.1", "::1") and parsed.port == self.server.server_port:
                     raise ValueError("Refusing a proxy routing loop")
+                if parsed.hostname in ("localhost", "127.0.0.1", "::1") and parsed.path.startswith("/_audit/"):
+                    raise ValueError("Refusing a stale audit endpoint")
                 providers.add(provider)
-                key = hashlib.sha256(_canon([provider, api, upstream]).encode()).hexdigest()[:20]
+                identity = [provider, api, upstream] + (["fetch"] if exact_path else [])
+                key = hashlib.sha256(_canon(identity).encode()).hexdigest()[:20]
                 prefix = "/_audit/" + key + "/"
-                routes.append(Route(prefix, upstream, api, automatic=True))
+                routes.append(Route(prefix, upstream, api, automatic=True, exact_path=exact_path))
                 response.append({"provider": provider,
                                  "baseUrl": f"http://127.0.0.1:{self.server.server_port}" + prefix.rstrip("/")})
             with self.route_lock:
@@ -1642,9 +1676,12 @@ class AuditHandler(BaseHTTPRequestHandler):
         base_path = route.base_path
         # A provider shim may advertise OpenAI but send Anthropic messages.
         # Normalize using the actual wire protocol, not only the catalog hint.
-        if route.automatic and protocol == "anthropic-messages" and base_path.endswith("/v1"):
+        if route.automatic and not route.exact_path and protocol == "anthropic-messages" and base_path.endswith("/v1"):
             base_path = base_path[:-3]
-        upstream_path = base_path + "/" + sub_path if not sub_path.startswith("/") else base_path + sub_path
+        if route.exact_path:
+            upstream_path = base_path + sub_path
+        else:
+            upstream_path = base_path + "/" + sub_path if not sub_path.startswith("/") else base_path + sub_path
         if not upstream_path.startswith("/"):
             upstream_path = "/" + upstream_path
 

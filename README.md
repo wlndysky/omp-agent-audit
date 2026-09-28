@@ -27,7 +27,7 @@ cd omp-agent-audit
 python omp_audit_proxy.py
 ```
 
-这一条命令会自动选择空闲端口、启动代理、生成临时扩展，再启动 OMP。扩展读取 OMP 当前有效的模型目录，仅在此次进程内覆盖上游地址，复用原来的模型和凭据；不修改 `models.yml`、不安装持久扩展、不修改父进程环境。其他已经打开的 OMP 窗口以及之后直接运行的 `omp` 不会自动使用该代理。
+这一条命令会自动选择空闲端口、启动代理、生成临时扩展，再启动 OMP。扩展读取 OMP 当前有效的模型目录，在此次进程的 HTTP fetch 出口转发匹配上游的请求，复用原来的模型和凭据；模型注册表保留原始地址，后台模型发现不会再把临时代理地址写入 `models.db`。不修改 `models.yml`、不安装持久扩展、不修改父进程环境。其他已经打开的 OMP 窗口以及之后直接运行的 `omp` 不会自动使用该代理。
 
 正常退出 OMP 后，启动器会关闭代理并删除临时扩展。OMP 自身仍按平常方式保存会话、使用记录等；这不是一个禁写沙箱。进程被强制结束时，临时文件的清理不保证执行。
 
@@ -70,7 +70,9 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 
 一键启动会复用 OMP 的 Anthropic 地址规则：先移除基础地址末尾的 `/v1`，再转发客户端追加的 `/v1/messages`，避免重复拼接。Chat Completions 和 Responses 的 `/v1` 基础路径保持不变。
 
-部分 provider 会登记为 OpenAI、实际通过适配层发送 Anthropic 请求。因此自动路由还会按每次请求的实际协议检查基础路径，而不只依赖模型目录中的 API 类型。日志的 `routing` 字段记录目录类型、实际协议及路径是否调整；手动路由不受此规则影响。
+部分 provider 会登记为 OpenAI、实际通过适配层发送 Anthropic 请求。一键启动在客户端完成协议适配后按 HTTP URL 路由，保留原始路径和查询参数，不重复增删 `/v1`。兼容旧扩展的自动路由仍按实际协议归一化路径；手动路由始终按配置原样转发。日志的 `routing` 字段记录目录类型、实际协议及路径是否调整。
+
+旧版本可能在后台刷新模型目录时，把 `http://127.0.0.1:<旧端口>/_audit/...` 缓存到 OMP 的 `models.db`，导致下次启动提示混合上游或旧审计地址。新版会指出受影响的 provider/model，并拒绝把旧代理地址当真实上游；不会猜测地址或修改用户配置。已受影响的缓存须先备份，再按可验证的原始上游修复。历史审计 JSON 无需处理。
 
 ### 可读 JSON 与增量写入
 
@@ -126,11 +128,12 @@ python -B -X utf8 test_readable_json.py
 - `--port`：一键模式自动选择空闲端口，仅代理模式默认 `8787`；`--upstream-connect-timeout` 默认 30 秒。
 - 正常按 OMP 自身方式退出，代理随后停止；一键模式的 `Ctrl+C` 保留 OMP 取消当前轮次的语义。
 
-测试使用本机合成数据；`--real-omp` 额外驱动已安装 OMP，使用临时独立配置和回环模拟上游，验证工具、路由、配置保留及可读 JSON，不调用付费模型或真实 MCP。JSON 测试覆盖思考全文、工具参数/结果、历史去重、追加字节保留、中断恢复和跨进程写入。
+测试使用本机合成数据；`--real-omp` 额外驱动已安装 OMP，使用临时独立配置和回环模拟上游，验证工具、路由、配置保留及可读 JSON，并验证 Kimi 刷新模型缓存后连续两次启动都保留原上游，不调用付费模型或真实 MCP。安装 Node.js 时还会运行临时扩展的 fetch 参数、路径边界和取消信号回归。JSON 测试覆盖思考全文、工具参数/结果、历史去重、追加字节保留、中断恢复和跨进程写入。
 
 ### 隐私与限制
 
 - 自动路由只覆盖上述三类 API，且要求同一 provider 的聊天模型使用同一上游地址和 API。其他或混合端点 provider 会明确提示未覆盖；启动时所选模型无法安全路由则停止，不会悄悄直接调用。运行中切换到未覆盖的 provider 不会自动获得审计覆盖。
+- 自动接入作用于此次 OMP 进程的全局 fetch。自定义独立传输、提前保存的原始 fetch 或 WebSocket 不保证覆盖，需显式接入代理。
 - 只对指定认证头、Cookie 和敏感查询参数脱敏。**正文中的密码、源码、Flag、文件路径、工具输出等仍可能原样出现，分享前必须审查。**
 - `.gitignore` 排除日志、缓存和常见本地配置，但不能清除已经提交的文件或 Git 历史。
 - 使用正常的 TLS 证书校验，仅允许回环绑定；回环绑定不能阻止其他本机进程访问。
@@ -161,7 +164,7 @@ cd omp-agent-audit
 python omp_audit_proxy.py
 ```
 
-This selects a free local port, starts the proxy, creates a temporary extension, and launches OMP. The extension reads OMP's effective model catalog and overrides provider URLs only in this process, keeping the existing models and credentials. It does not edit `models.yml`, install a persistent extension, or change the parent environment. Other OMP windows and later plain `omp` launches do not inherit the proxy.
+This selects a free local port, starts the proxy, creates a temporary extension, and launches OMP. The extension reads OMP's effective model catalog and redirects matching requests at this process's HTTP fetch boundary, keeping existing models and credentials. Registry URLs remain unchanged, so background model discovery no longer writes temporary proxy URLs into `models.db`. It does not edit `models.yml`, install a persistent extension, or change the parent environment. Other OMP windows and later plain `omp` launches do not inherit the proxy.
 
 When OMP exits normally, the launcher stops the proxy and removes the temporary extension. OMP itself still saves sessions and usage information as usual; this is not a no-write sandbox. Cleanup is not guaranteed if the process is forcibly killed.
 
@@ -204,7 +207,9 @@ Explicit `--route` entries only replace the local prefix and do not deduplicate 
 
 One-command launches mirror OMP's Anthropic URL normalization: remove a trailing `/v1` from the base before forwarding the client's `/v1/messages` suffix. Chat Completions and Responses retain their `/v1` base paths.
 
-Some provider shims advertise an OpenAI API while sending Anthropic requests. Automatic routes therefore check each request's wire protocol, not only the model catalog hint. The `routing` log field records the catalog API, wire API, and whether the base path changed. Explicit manual routes remain untouched.
+Some provider shims advertise an OpenAI API while sending Anthropic requests. The launcher now routes the final HTTP URL after client protocol adaptation, preserving the exact path and query without adding or removing `/v1`. Compatibility routes for older extensions still normalize by wire protocol; explicit manual routes remain literal. The `routing` log field records the catalog API, wire API, and whether the base path changed.
+
+Older versions could allow background discovery to persist `http://127.0.0.1:<old-port>/_audit/...` in OMP's `models.db`. A subsequent launch can then report mixed endpoints or a stale audit URL. The new launcher identifies the affected provider/model and refuses to treat that URL as a real upstream. Back up affected caches and restore only verified original endpoints; the launcher does not guess endpoints or edit user configuration. Historical audit JSON needs no migration.
 
 ### Readable JSON and incremental writes
 
@@ -258,11 +263,12 @@ python -B -X utf8 test_readable_json.py
 - `--log-max-bytes` / `--log-backups` rotate only optional indexes (64 MiB / 5 backups by default). Public JSON and internal evidence are not automatically rotated.
 - `--port` is automatically selected in launcher mode and defaults to `8787` in proxy-only mode; upstream connect timeout defaults to 30 seconds.
 
-Tests use local synthetic fixtures. `--real-omp` additionally drives installed OMP against loopback mock upstreams with isolated temporary configuration, checking tools, routing, unchanged configuration and readable JSON. No paid models or real MCP services are invoked. JSON regressions cover full thinking, complete tool payloads, deduplication, preservation of earlier bytes, interrupted-write recovery and concurrent processes.
+Tests use local synthetic fixtures. `--real-omp` additionally drives installed OMP against loopback mock upstreams with isolated temporary configuration, checking tools, routing, unchanged configuration and readable JSON, including two Kimi launches with discovery refreshes and clean cached endpoints. When Node.js is available, tests also exercise fetch arguments, endpoint boundaries and cancellation in the temporary extension. No paid models or real MCP services are invoked. JSON regressions cover full thinking, complete tool payloads, deduplication, preservation of earlier bytes, interrupted-write recovery and concurrent processes.
 
 ### Privacy and limitations
 
 - Automatic routing covers the three APIs above and requires a uniform chat-model endpoint and API within each provider. Unsupported or mixed-endpoint providers are reported as uncovered. An unsupported selection at startup stops the child instead of silently calling it directly. Switching to an uncovered provider later does not automatically add audit coverage.
+- Automatic interception uses this OMP process's global fetch. Independent custom transports, previously captured fetch functions and WebSockets are not guaranteed to be covered; use an explicit proxy connection for those clients.
 - Selected authentication headers, cookies, and sensitive query parameters are redacted. **Bodies may still contain passwords, source code, flags, paths, and tool output. Review logs before sharing.**
 - `.gitignore` excludes logs, caches, and common local configuration; it cannot erase tracked files or existing Git history.
 - Normal TLS certificate verification is used and non-loopback binding is refused. Loopback binding is not access control against other local processes.

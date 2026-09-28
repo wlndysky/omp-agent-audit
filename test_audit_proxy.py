@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -367,6 +368,8 @@ def launcher_regressions():
                 {**route, "upstream": "https://name:secret@upstream.example/v1"}]})[0] == 400))
             checks.append(("launcher_control_rejects_self_loop", register({"routes": [
                 {**route, "upstream": f"http://127.0.0.1:{server.server_port}"}]})[0] == 400))
+            checks.append(("launcher_control_rejects_stale_audit_endpoints", register({"routes": [
+                {**route, "upstream": "http://127.0.0.1:9/_audit/old"}]})[0] == 400))
             status, response = register({"routes": [route], "ready": True})
             again_status, again = register({"routes": [route]})
             checks.append(("launcher_routes_registered_idempotently", status == again_status == 200
@@ -441,6 +444,11 @@ def shim_route_regressions():
         anthropic_status, _ = post(proxy.server_port, route_path + "/v1/messages?beta=true", body)
         openai_status, _ = post(proxy.server_port, route_path + "/chat/completions", body)
         manual_status, _ = post(proxy.server_port, "/manual/v1/messages?beta=true", body)
+        exact_status, exact_registered = post(proxy.server_port, ap.CONTROL_PATH, {"routes": [{
+            "provider": "fetch-fixture", "api": "openai-completions", "upstream": base, "exact_path": True}]},
+            headers={"Authorization": "Bearer synthetic-control-token"})
+        exact_path = json.loads(exact_registered)["routes"][0]["baseUrl"].split(str(proxy.server_port), 1)[1]
+        fetch_status, _ = post(proxy.server_port, exact_path + "//messages?beta=true", body)
         return [
             ("shim_openai_catalog_anthropic_wire_avoids_duplicate_v1",
              anthropic_status == 200 and seen[0] == "/gateway/v1/messages?beta=true"),
@@ -448,11 +456,92 @@ def shim_route_regressions():
              openai_status == 200 and seen[1] == "/gateway/v1/chat/completions"),
             ("shim_does_not_rewrite_explicit_manual_routes",
              manual_status == 404 and seen[2] == "/gateway/v1/v1/messages?beta=true"),
+            ("fetch_routes_preserve_shim_wire_path_and_query_exactly", exact_status == fetch_status == 200
+             and seen[3] == "/gateway/v1/messages?beta=true"),
         ]
     finally:
         for server in (proxy, upstream):
             server.shutdown()
             server.server_close()
+
+
+def launcher_fetch_regressions():
+    """Exercise the actual launcher JS without a network or model call."""
+    node = shutil.which("node")
+    if not node:
+        return []
+    script = r'''
+import assert from "node:assert/strict";
+const checks = [];
+const captured = [];
+const catalog = [
+  {provider: "chat", id: "fixture", api: "openai-completions", baseUrl: "https://chat.example/v1"},
+  {provider: "messages", id: "fixture", api: "anthropic-messages", baseUrl: "https://chat.example/gateway/v1"},
+  {provider: "nested", id: "fixture", api: "openai-completions", baseUrl: "https://chat.example/v1/nested"},
+];
+const initial = JSON.stringify(catalog);
+process.env.OMP_AUDIT_CONTROL_URL = "http://127.0.0.1:8123";
+process.env.OMP_AUDIT_CONTROL_TOKEN = "test-only";
+const nativeFetch = async (input, init) => {
+  const url = input instanceof Request ? input.url : String(input);
+  if (url.endsWith("/__audit/routes")) {
+    const body = JSON.parse(init.body);
+    assert(body.routes.every(r => r.exact_path === true));
+    return Response.json({routes: body.routes.map(r => ({provider: r.provider,
+      baseUrl: "http://127.0.0.1:8123/_audit/" + r.provider}))});
+  }
+  captured.push({input, init, url});
+  return new Response("ok");
+};
+nativeFetch.preconnect = () => "preserved";
+globalThis.fetch = nativeFetch;
+const extension = await import("data:text/javascript;base64," + SOURCE);
+let start;
+extension.default({on: (name, handler) => { if (name === "session_start") start = handler; },
+  registerProvider: () => { throw new Error("registry must not be rewritten"); },
+  setModel: () => { throw new Error("model must not be rewritten"); }});
+const ctx = {model: catalog[0], modelRegistry: {getAll: () => catalog}};
+await start({}, ctx);
+assert.equal(JSON.stringify(catalog), initial);
+checks.push(["launcher_fetch_preserves_catalog_and_discovery_endpoints", true]);
+const controller = new AbortController();
+const options = {method: "POST", body: "exact body", headers: {Authorization: "test-only"}, signal: controller.signal};
+await fetch("https://chat.example/v1/chat/completions?key=a%2Bb", options);
+assert.equal(captured.at(-1).url, "http://127.0.0.1:8123/_audit/chat//chat/completions?key=a%2Bb");
+assert.equal(captured.at(-1).init, options);
+checks.push(["launcher_fetch_keeps_auth_body_options_signal_and_query", true]);
+const request = new Request("https://chat.example/gateway/v1/messages?beta=true", options);
+await fetch(request);
+const forwarded = captured.at(-1).input;
+assert.equal(forwarded.url, "http://127.0.0.1:8123/_audit/messages//messages?beta=true");
+assert.equal(forwarded.headers.get("authorization"), "test-only");
+assert.equal(await forwarded.text(), "exact body");
+controller.abort();
+assert.equal(forwarded.signal.aborted, true);
+checks.push(["launcher_fetch_keeps_request_objects_and_cancellation", true]);
+await fetch(new URL("https://chat.example/v1/nested/chat/completions"));
+assert.equal(captured.at(-1).url, "http://127.0.0.1:8123/_audit/nested//chat/completions");
+checks.push(["launcher_fetch_uses_longest_endpoint_match", true]);
+for (const url of ["https://chat.example/v10/chat/completions", "https://chat.example.evil/v1/chat/completions",
+    "https://unrelated.example/v1/messages"]) {
+  await fetch(url);
+  assert.equal(captured.at(-1).url, url);
+}
+assert.equal(fetch.preconnect(), "preserved");
+checks.push(["launcher_fetch_respects_origin_boundaries_and_native_properties", true]);
+await start({}, ctx);
+await fetch("https://chat.example/v1/models");
+assert.equal(captured.at(-1).url, "http://127.0.0.1:8123/_audit/chat//models");
+assert.equal(JSON.stringify(catalog), initial);
+checks.push(["launcher_fetch_repeated_session_start_does_not_nest_routing", true]);
+process.stdout.write(JSON.stringify(checks));
+'''
+    source = ap.base64.b64encode(ap.LAUNCHER_EXTENSION.encode()).decode()
+    run = subprocess.run([node, "--input-type=module", "-e", script.replace("SOURCE", json.dumps(source))],
+                         capture_output=True, text=True, encoding="utf-8", timeout=20)
+    if run.returncode:
+        raise RuntimeError("Launcher fetch regression failed: " + run.stderr[-2500:])
+    return [tuple(check) for check in json.loads(run.stdout)]
 
 
 def session_archive_regressions(directory_parent=None):
@@ -504,7 +593,7 @@ def windows_launcher_regressions():
         return checks
 
 
-def real_omp_smoke(api="openai-completions"):
+def real_omp_smoke(api="openai-completions", *, discovered=False):
     """Optional real OMP + fake provider, using an isolated temporary agent dir."""
     if not shutil.which("omp"):
         raise RuntimeError("--real-omp requires an installed omp executable")
@@ -519,6 +608,9 @@ def real_omp_smoke(api="openai-completions"):
         requests = []
         request_paths = []
         fixture_thinking = "AUDIT_THINK_FULL\n完整的模拟思考文本"
+        provider_id = "kimi-code" if discovered else "audit-fixture"
+        model_id = "k3" if discovered else "fixture"
+        discovery_requests = []
         is_anthropic = api == "anthropic-messages"
         base_path = "/gateway/v1" if is_anthropic else "/v1"
         expected_path = base_path + ("/messages" if is_anthropic else "/chat/completions")
@@ -528,6 +620,16 @@ def real_omp_smoke(api="openai-completions"):
 
             def log_message(self, *args):
                 pass
+
+            def do_GET(self):
+                discovery_requests.append(self.path)
+                data = json.dumps({"data": [{"id": model_id, "protocol": None, "context_length": 32768},
+                                             {"id": "k3-256k", "protocol": None}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -595,11 +697,15 @@ def real_omp_smoke(api="openai-completions"):
         mock = ap.AuditHTTPServer(("127.0.0.1", 0), Provider)
         threading.Thread(target=mock.serve_forever, daemon=True).start()
         models_path = os.path.join(agent_dir, "models.yml")
-        configuration = {"providers": {"audit-fixture": {
+        configuration = {"providers": {provider_id: {
             "baseUrl": f"http://127.0.0.1:{mock.server_port}" + base_path, "api": api, "auth": "none",
-            "models": [{"id": "fixture", "name": "Audit Fixture", "reasoning": False,
+            "models": [{"id": model_id, "name": "Audit Fixture", "reasoning": False,
                         "input": ["text"], "contextWindow": 32768, "maxTokens": 1024}],
         }}}
+        if discovered:
+            configuration["providers"][provider_id].pop("auth")
+            configuration["providers"][provider_id]["apiKey"] = "synthetic-local-only"
+            configuration["providers"][provider_id]["models"][0]["compat"] = {"kimiApiFormat": "openai"}
         original = json.dumps(configuration).encode()
         with open(models_path, "wb") as fh:
             fh.write(original)
@@ -611,16 +717,29 @@ def real_omp_smoke(api="openai-completions"):
             command = [
                 sys.executable, "-B", "-u", "-X", "utf8", os.path.abspath(ap.__file__), "--log", logpath, "--",
                 "--cwd", workspace, "--no-extensions", "--no-skills", "--no-rules", "--no-lsp",
-                "--no-session", "--no-title", "--tools", "read", "--model", "audit-fixture/fixture",
+                "--no-session", "--no-title", "--tools", "read", "--model", provider_id + "/" + model_id,
                 "--thinking", "off", "-p", "Read fixture.txt with the read tool, then report its contents.",
             ]
+            probe_path = os.path.join(directory, "catalog-probe.json")
+            if discovered:
+                extension = os.path.join(directory, "probe.mjs")
+                with open(extension, "w", encoding="utf-8") as fh:
+                    fh.write('import {writeFileSync} from "node:fs";\n'
+                             'export default function(pi) { pi.on("session_start", async (_e, ctx) => {\n'
+                             'const before = ctx.modelRegistry.find("kimi-code", "k3").baseUrl;\n'
+                             'await ctx.modelRegistry.refreshProvider("kimi-code", "online");\n'
+                             'const after = ctx.modelRegistry.find("kimi-code", "k3").baseUrl;\n'
+                             'writeFileSync(' + json.dumps(probe_path) + ', JSON.stringify({before, after}));\n'
+                             '}); }\n')
+                command.extend(["--extension", extension])
             run = subprocess.run(command, env=environment, cwd=workspace, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=55, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             if run.returncode != 0:
                 raise RuntimeError("Real OMP smoke failed: " + run.stderr[-6500:] + run.stdout[-2500:])
             with open(models_path, "rb") as fh:
                 unchanged = fh.read() == original
-            session_archives = list(ap.iter_session_records(os.path.join(directory, "logs")))
+            session_archives = [r for r in ap.iter_session_records(os.path.join(directory, "logs"))
+                                if r.get("method") == "POST"]
             tool_results = [e for archive in session_archives for e in archive.get("tool_trace", [])
                             if e.get("event") == "tool_result"]
             documents = []
@@ -629,14 +748,6 @@ def real_omp_smoke(api="openai-completions"):
                     with open(os.path.join(directory, "logs", name), encoding="utf-8") as fh:
                         documents.append(json.load(fh))
             readable_turns = [turn for document in documents for turn in document["turns"]]
-            before_failed_run = len(requests)
-            configuration["providers"]["audit-fixture"]["models"].append({
-                "id": "other", "baseUrl": f"http://127.0.0.1:{mock.server_port}/different/v1"})
-            with open(models_path, "w", encoding="utf-8") as fh:
-                json.dump(configuration, fh)
-            failed = subprocess.run(command, env=environment, cwd=workspace, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=55,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             checks = [
                 ("real_omp_launcher_exit_success", run.returncode == 0 and "AUDIT_LOCAL_OK" in run.stdout),
                 ("real_omp_configuration_unchanged", unchanged),
@@ -655,9 +766,52 @@ def real_omp_smoke(api="openai-completions"):
                          for archive in session_archives for event in archive["tool_trace"])),
                 ("real_omp_exact_upstream_paths", len(request_paths) == 2
                  and all(path.split("?", 1)[0] == expected_path for path in request_paths)),
-                ("real_omp_unsafe_routing_stops_before_inference", failed.returncode != 0
-                 and len(requests) == before_failed_run and "cannot be safely auto-routed" in failed.stderr),
             ]
+            if discovered:
+                upstream = configuration["providers"][provider_id]["baseUrl"]
+                with open(probe_path, encoding="utf-8") as fh:
+                    probe = json.load(fh)
+                def cache_models():
+                    db = sqlite3.connect(os.path.join(agent_dir, "models.db"))
+                    try:
+                        return [model for (raw,) in db.execute("SELECT models FROM model_cache WHERE provider_id = ?",
+                                                              (provider_id,)) for model in json.loads(raw)]
+                    finally:
+                        db.close()
+                first_cache = cache_models()
+                restarted = subprocess.run(command, env=environment, cwd=workspace, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=55,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                second_cache = cache_models()
+                def clean_discovery_cache(models):
+                    # Kimi also caches bundled fallback rows at their canonical
+                    # endpoint; only dynamically discovered IDs use the fixture.
+                    return (all('/_audit/' not in m.get('baseUrl', '') for m in models)
+                            and all(any(m['id'] == model and m['baseUrl'] == upstream for m in models)
+                                    for model in (model_id, 'k3-256k')))
+                all_archives = list(ap.iter_session_records(os.path.join(directory, "logs")))
+                checks.extend([
+                    ("real_omp_catalog_refresh_keeps_original_endpoints", probe == {"before": upstream, "after": upstream}),
+                    ("real_omp_discovered_cache_contains_original_endpoints", clean_discovery_cache(first_cache)),
+                    ("real_omp_second_launch_succeeds_without_stale_routes", restarted.returncode == 0
+                     and "AUDIT_LOCAL_OK" in restarted.stdout and len(requests) == 4),
+                    ("real_omp_second_refresh_does_not_pollute_cache", clean_discovery_cache(second_cache)),
+                    ("real_omp_discovery_and_restart_requests_are_audited", len(discovery_requests) >= 2
+                     and sum(r.get("method") == "POST" for r in all_archives) == 4),
+                ])
+            else:
+                before_failed_run = len(requests)
+                configuration["providers"][provider_id]["models"].append({
+                    "id": "other", "baseUrl": f"http://127.0.0.1:{mock.server_port}/different/v1"})
+                with open(models_path, "w", encoding="utf-8") as fh:
+                    json.dump(configuration, fh)
+                failed = subprocess.run(command, env=environment, cwd=workspace, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=55,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                checks.append(("real_omp_unsafe_routing_stops_before_inference", failed.returncode != 0
+                               and len(requests) == before_failed_run and "cannot be safely auto-routed" in failed.stderr))
+            if discovered:
+                return [(name.replace("real_omp_", "real_omp_kimi_"), ok) for name, ok in checks]
             return [(name.replace("real_omp_", "real_omp_anthropic_") if is_anthropic else name, ok)
                     for name, ok in checks]
         finally:
@@ -925,12 +1079,14 @@ def main():
         and e.get("content") == "pong" for e in tool_lines)))
     results.extend(tool_regressions())
     results.extend(launcher_regressions())
+    results.extend(launcher_fetch_regressions())
     results.extend(shim_route_regressions())
     results.extend(session_archive_regressions())
     results.extend(windows_launcher_regressions())
     if "--real-omp" in sys.argv:
         results.extend(real_omp_smoke())
         results.extend(real_omp_smoke("anthropic-messages"))
+        results.extend(real_omp_smoke(discovered=True))
 
     fb_ids = [r["classification"]["primary_id"] for r in noid_records]
     results.append(("fallback_used", all(r["classification"]["confidence"] == "low" for r in noid_records)))
