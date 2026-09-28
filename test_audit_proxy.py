@@ -342,6 +342,20 @@ def launcher_regressions():
             again_status, again = register({"routes": [route]})
             checks.append(("launcher_routes_registered_idempotently", status == again_status == 200
                            and response == again and len(handler.routes) == 1))
+            checks.append(("launcher_preserves_openai_v1_base", handler.routes[0].base_path == "/v1"))
+            anthropic = {"provider": "messages-fixture", "api": "anthropic-messages",
+                         "upstream": "https://upstream.example/gateway/v1"}
+            ant_status, ant_response = register({"routes": [anthropic]})
+            ant_route = next(r for r in handler.routes if r.hint == "anthropic-messages")
+            checks.append(("launcher_normalizes_anthropic_v1_base", ant_status == 200
+                           and ant_route.base_path == "/gateway"))
+            variants = ["/gateway", "/gateway/", "/gateway/v1///"]
+            variant_results = [register({"routes": [{**anthropic,
+                "upstream": "https://upstream.example" + suffix}]}) for suffix in variants]
+            checks.append(("launcher_equivalent_anthropic_bases_share_route",
+                           all(code == 200 and value == ant_response for code, value in variant_results)))
+            checks.append(("explicit_routes_keep_literal_v1_base",
+                           ap.Route("/manual/", anthropic["upstream"], anthropic["api"]).base_path == "/gateway/v1"))
             return 0
 
         def poll(self):
@@ -363,7 +377,7 @@ def launcher_regressions():
     return checks
 
 
-def real_omp_smoke():
+def real_omp_smoke(api="openai-completions"):
     """Optional real OMP + fake provider, using an isolated temporary agent dir."""
     if not shutil.which("omp"):
         raise RuntimeError("--real-omp requires an installed omp executable")
@@ -376,6 +390,10 @@ def real_omp_smoke():
         with open(fixture, "w", encoding="utf-8") as fh:
             fh.write("AUDIT_READ_OK\n")
         requests = []
+        request_paths = []
+        is_anthropic = api == "anthropic-messages"
+        base_path = "/gateway/v1" if is_anthropic else "/v1"
+        expected_path = base_path + ("/messages" if is_anthropic else "/chat/completions")
 
         class Provider(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -386,8 +404,22 @@ def real_omp_smoke():
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 requests.append(body)
+                request_paths.append(self.path)
+                if self.path.split("?", 1)[0] != expected_path:
+                    data = b'{"error":{"type":"resource_not_found_error","message":"Unexpected endpoint"}}'
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 messages = body.get("messages", [])
                 completed = any(m.get("role") == "tool" for m in messages)
+                if is_anthropic:
+                    completed = any(
+                        isinstance(m.get("content"), list) and any(
+                            isinstance(block, dict) and block.get("type") == "tool_result"
+                            for block in m["content"]) for m in messages)
                 delta = {"role": "assistant"}
                 if completed:
                     delta["content"] = "AUDIT_LOCAL_OK"
@@ -402,6 +434,25 @@ def real_omp_smoke():
                      "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
                 ]
                 data = ("".join("data: " + json.dumps(c) + "\n\n" for c in chunks) + "data: [DONE]\n\n").encode()
+                if is_anthropic:
+                    content = ({"type": "text", "text": ""} if completed else
+                               {"type": "tool_use", "id": "call_fixture", "name": "read", "input": {}})
+                    content_delta = ({"type": "text_delta", "text": "AUDIT_LOCAL_OK"} if completed else
+                                     {"type": "input_json_delta", "partial_json": json.dumps({"path": fixture})})
+                    chunks = [
+                        {"type": "message_start", "message": {"id": "msg-fixture-" + str(len(requests)),
+                         "type": "message", "role": "assistant", "model": "fixture", "content": [],
+                         "stop_reason": None, "stop_sequence": None,
+                         "usage": {"input_tokens": 10, "output_tokens": 0}}},
+                        {"type": "content_block_start", "index": 0, "content_block": content},
+                        {"type": "content_block_delta", "index": 0, "delta": content_delta},
+                        {"type": "content_block_stop", "index": 0},
+                        {"type": "message_delta", "delta": {"stop_reason": "end_turn" if completed else "tool_use",
+                         "stop_sequence": None}, "usage": {"output_tokens": 5}},
+                        {"type": "message_stop"},
+                    ]
+                    data = "".join("event: " + c["type"] + "\ndata: " + json.dumps(c) + "\n\n"
+                                   for c in chunks).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Content-Length", str(len(data)))
@@ -412,7 +463,7 @@ def real_omp_smoke():
         threading.Thread(target=mock.serve_forever, daemon=True).start()
         models_path = os.path.join(agent_dir, "models.yml")
         configuration = {"providers": {"audit-fixture": {
-            "baseUrl": f"http://127.0.0.1:{mock.server_port}/v1", "api": "openai-completions", "auth": "none",
+            "baseUrl": f"http://127.0.0.1:{mock.server_port}" + base_path, "api": api, "auth": "none",
             "models": [{"id": "fixture", "name": "Audit Fixture", "reasoning": False,
                         "input": ["text"], "contextWindow": 32768, "maxTokens": 1024}],
         }}}
@@ -447,15 +498,19 @@ def real_omp_smoke():
             failed = subprocess.run(command, env=environment, cwd=workspace, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=55,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-            return [
+            checks = [
                 ("real_omp_launcher_exit_success", run.returncode == 0 and "AUDIT_LOCAL_OK" in run.stdout),
                 ("real_omp_configuration_unchanged", unchanged),
                 ("real_omp_read_tool_audited", any(e.get("tool_name") == "read"
                   and "AUDIT_READ_OK" in str(e.get("content")) and e.get("correlated") for e in tool_results)),
                 ("real_omp_two_model_rounds_forwarded", len(requests) >= 2),
+                ("real_omp_exact_upstream_paths", len(request_paths) == 2
+                 and all(path.split("?", 1)[0] == expected_path for path in request_paths)),
                 ("real_omp_unsafe_routing_stops_before_inference", failed.returncode != 0
                  and len(requests) == before_failed_run and "cannot be safely auto-routed" in failed.stderr),
             ]
+            return [(name.replace("real_omp_", "real_omp_anthropic_") if is_anthropic else name, ok)
+                    for name, ok in checks]
         finally:
             mock.shutdown()
             mock.server_close()
@@ -694,6 +749,7 @@ def main():
     results.extend(launcher_regressions())
     if "--real-omp" in sys.argv:
         results.extend(real_omp_smoke())
+        results.extend(real_omp_smoke("anthropic-messages"))
 
     fb_ids = [r["classification"]["primary_id"] for r in noid_records]
     results.append(("fallback_used", all(r["classification"]["confidence"] == "low" for r in noid_records)))

@@ -64,7 +64,9 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 | Anthropic Messages | `/messages/=https://upstream.example=anthropic-messages` | `http://127.0.0.1:8787/messages` |
 | Responses | `/responses/=https://upstream.example/v1=openai-responses` | `http://127.0.0.1:8787/responses` |
 
-代理只替换前缀，不会自动去重上游路径中的 `/v1`。请按原 provider 的实际请求路径设置上游基础地址。不要把凭据放进路由 URL。
+手动 `--route` 只替换前缀，不会自动去重上游路径中的 `/v1`。请按原 provider 的实际请求路径设置上游基础地址。不要把凭据放进路由 URL。
+
+一键启动会复用 OMP 的 Anthropic 地址规则：先移除基础地址末尾的 `/v1`，再转发客户端追加的 `/v1/messages`，避免重复拼接。Chat Completions 和 Responses 的 `/v1` 基础路径保持不变。
 
 ### 日志与操作
 
@@ -160,7 +162,9 @@ Syntax: `--route /local-prefix/=upstream-base=protocol`. Repeat the option for m
 | Anthropic Messages | `/messages/=https://upstream.example=anthropic-messages` | `http://127.0.0.1:8787/messages` |
 | Responses | `/responses/=https://upstream.example/v1=openai-responses` | `http://127.0.0.1:8787/responses` |
 
-Only the local prefix is replaced. The proxy does not deduplicate `/v1`; match your provider's actual request path when choosing the upstream base. Do not put credentials in route URLs.
+Explicit `--route` entries only replace the local prefix and do not deduplicate `/v1`; match your provider's actual request path when choosing the upstream base. Do not put credentials in route URLs.
+
+One-command launches mirror OMP's Anthropic URL normalization: remove a trailing `/v1` from the base before forwarding the client's `/v1/messages` suffix. Chat Completions and Responses retain their `/v1` base paths.
 
 ### Logs and operation
 

@@ -962,6 +962,12 @@ class AuditHandler(BaseHTTPRequestHandler):
                     raise ValueError("Missing or duplicate provider")
                 if api not in SUPPORTED_APIS or not isinstance(upstream, str):
                     raise ValueError("Unsupported route protocol")
+                # Mirror OMP's normalizeAnthropicBaseUrl before replacing the
+                # model URL: its client appends /v1/messages to the local URL.
+                # This is launcher-only; explicit --route paths stay literal.
+                upstream = upstream.strip().rstrip("/")
+                if api == "anthropic-messages" and upstream.endswith("/v1"):
+                    upstream = upstream[:-3]
                 parsed = urllib.parse.urlsplit(upstream)
                 if (parsed.scheme not in ("http", "https") or not parsed.hostname
                         or parsed.username or parsed.password or parsed.query or parsed.fragment):
