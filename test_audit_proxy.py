@@ -89,6 +89,7 @@ RESPONSES_SSE = ''.join('data: ' + json.dumps(event) + '\n\n' for event in [
 
 class MockUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    completed_client_closed = threading.Event()
 
     def log_message(self, *a):
         pass
@@ -135,6 +136,20 @@ class MockUpstream(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/up-complete/v1/messages"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.wfile.write(ANTHROPIC_SSE.encode())
+                self.wfile.flush()
+                if self.completed_client_closed.wait(5):
+                    self.wfile.write(b":" + b"k" * (1024 * 1024) + b"\n\n")
+                    self.wfile.flush()
+            except OSError:
+                pass
         elif self.path.startswith("/up-slow/v1/messages"):
             # 断连测试：先发一小段，延迟后发大块（客户端已断开）
             first = b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_slow"}}\n\n'
@@ -261,6 +276,15 @@ def tool_regressions():
     h2 = ap.fallback_stream_id("openai-responses", {"instructions": "sys", "input": "two"})
     checks.append(("responses_string_input_hash_distinguishes_users", bool(h1) and h1 != h2))
     checks.append(("unknown_tool_name_not_mislabeled_builtin", ap.tool_kind_hint("custom_echo") == "custom_or_unknown"))
+    for protocol, payload in (("anthropic-messages", ANTHROPIC_SSE),
+                              ("openai-completions", OPENAI_SSE), ("openai-responses", RESPONSES_SSE)):
+        complete = ap.SseTap(protocol)
+        complete.feed(payload.encode())
+        complete.flush()
+        checks.append((protocol + "_terminal_event_marks_capture_complete", complete.complete))
+    unfinished = ap.SseTap("anthropic-messages")
+    unfinished.feed(b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n')
+    checks.append(("stop_reason_without_terminal_event_is_not_complete", not unfinished.complete))
     return checks
 
 
@@ -657,6 +681,7 @@ def main():
         ap.Route("/up-noid/", f"http://127.0.0.1:{mock_port}/up-noid", "openai-completions"),
         ap.Route("/up-json/", f"http://127.0.0.1:{mock_port}/up-json", "openai-completions"),
         ap.Route("/up-slow/", f"http://127.0.0.1:{mock_port}/up-slow", "anthropic-messages"),
+        ap.Route("/up-complete/", f"http://127.0.0.1:{mock_port}/up-complete", "anthropic-messages"),
         ap.Route("/up-responses/", f"http://127.0.0.1:{mock_port}/up-responses", "openai-responses"),
     ]
     ap.AuditHandler.routes = routes
@@ -768,6 +793,25 @@ def main():
     sock.recv(65536)
     sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_LINGER, _struct.pack("ii", 1, 0))
     sock.close()  # RST
+
+    # OMP may close after the terminal SSE event while transport framing is still pending.
+    MockUpstream.completed_client_closed.clear()
+    sock = _socket.create_connection(("127.0.0.1", proxy_port), timeout=5)
+    received = bytearray()
+    try:
+        sock.sendall(
+            b"POST /up-complete/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode()
+            + b"\r\n\r\n" + body)
+        while b'data: {"type":"message_stop"}\n\n' not in received:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("Fixture closed before the terminal SSE event")
+            received.extend(chunk)
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_LINGER, _struct.pack("ii", 1, 0))
+    finally:
+        sock.close()
+        MockUpstream.completed_client_closed.set()
 
     time.sleep(1.0)  # 等断连记录落盘
     proxy.shutdown()
@@ -895,6 +939,21 @@ def main():
 
     r_slow = by_path["/up-slow/v1/messages"][0]
     results.append(("client_disconnect_recorded", r_slow.get("client_disconnect") is True))
+    results.append(("unfinished_client_disconnect_still_marks_truncation",
+                    r_slow["response"]["sse_complete"] is False
+                    and r_slow.get("response_truncated_by") == "client_disconnect"))
+    r_complete = by_path["/up-complete/v1/messages"][0]
+    results.append(("disconnect_after_terminal_preserves_complete_capture",
+                    r_complete.get("client_disconnect") is True and r_complete["response"]["sse_complete"] is True
+                    and "response_truncated_by" not in r_complete
+                    and r_complete["chatml"]["messages"][-1]["thinking"] == "让我想想"))
+    complete_turns = []
+    for name in os.listdir(logdir):
+        if name.startswith("session-") and name.endswith("-rl.json"):
+            with open(os.path.join(logdir, name), encoding="utf-8") as fh:
+                complete_turns.extend(t for t in json.load(fh)["turns"] if t["exchange_id"] == r_complete["exchange_id"])
+    results.append(("readable_json_distinguishes_complete_sse_from_socket_disconnect", len(complete_turns) == 1
+                    and complete_turns[0]["sse_complete"] is True and "response_truncated_by" not in complete_turns[0]))
 
     results.append(("redact_authorization", SECRET_HEADER not in raw_log))
     results.append(("redact_x_api_key", SECRET_APIKEY not in raw_log))

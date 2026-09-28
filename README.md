@@ -77,6 +77,7 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 一键启动默认输出到脚本旁的 `audit-logs/<本次运行ID>/`。Windows 启动脚本默认输出到脚本目录的上一级。
 
 - `session-<分组ID>-rl.json`：真正的、格式化的 JSON 文档，直接打开或 `json.load()` 即可读，不需要重放补丁。
+- `turns[].sse_complete`：是否捕获到 SSE 协议结束事件。客户端在结束事件后关闭连接仍记录 `client_disconnect`，但不再误标 `response_truncated_by`；此字段表示捕获完整，不保证客户端已收到每个字节。
 - `turns[].thinking`：该次响应中 API 实际返回的完整思考文本；没有返回时为 `null`，不会编造内容。
 - `turns[].tool_calls`：工具调用 ID、名称和完整 `arguments`；`turns[].tool_results`：工具名、参数、完整 `content` 及错误状态。
 - `turns[].input_messages`：新增的 system/developer/user 消息；`recovered_messages` 保留尚未记录的历史助手消息和工具结果。
@@ -209,6 +210,7 @@ Some provider shims advertise an OpenAI API while sending Anthropic requests. Au
 Launcher output defaults to `audit-logs/<run-id>/` beside the script. The Windows launcher defaults to the script directory's parent.
 
 - `session-<group-id>-rl.json` is real, formatted JSON. Open it directly or use `json.load()`; no patch replay is needed.
+- `turns[].sse_complete` reports whether the SSE protocol terminal event was captured. A client disconnect after completion remains recorded, without a false `response_truncated_by` marker. This describes capture completeness, not guaranteed byte delivery to the client.
 - `turns[].thinking` contains the complete reasoning text actually exposed by that response; absent reasoning is `null` and is never invented.
 - `turns[].tool_calls` contains call IDs, tool names and complete `arguments`. `turns[].tool_results` contains names, arguments, full result `content` and error status.
 - `turns[].input_messages` contains new system/developer/user messages; `recovered_messages` retains previously unseen assistant history and tool results.

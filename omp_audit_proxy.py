@@ -638,6 +638,8 @@ class SessionJsonWriter:
             turn["stop_reason"] = source_assistant["stop_reason"]
         if response.get("usage"):
             turn["usage"] = response["usage"]
+        if "sse_complete" in response:
+            turn["sse_complete"] = response["sse_complete"]
         for key in ("duration_ms", "error", "client_disconnect", "response_truncated_by"):
             if key in record:
                 turn[key] = record[key]
@@ -1152,6 +1154,7 @@ class SseTap:
         self.events: list[dict] = []
         self.event_bytes = 0
         self.truncated = False
+        self.complete = False  # A protocol terminal event was captured, independent of socket closure.
         self.ids: list[dict] = []  # {id, source, confidence}
         self._seen_ids: set[str] = set()
         # 助手消息组装（ChatML 视图用）
@@ -1200,6 +1203,7 @@ class SseTap:
         event = self.cur_event
         self.cur_event, self.cur_data = None, []
         if data == "[DONE]":
+            self.complete = True
             self._store(event, {"done": True})
             return
         obj = None
@@ -1225,6 +1229,8 @@ class SseTap:
     def _extract(self, event: str | None, obj: dict) -> None:
         """按协议提取 ID / thinking / 文本 / 工具调用。"""
         if self.protocol == "anthropic-messages":
+            if (obj.get("type") or event) == "message_stop":
+                self.complete = True
             if event == "message_start" and isinstance(obj.get("message"), dict):
                 msg = obj["message"]
                 self._add_id(msg.get("id"), "body:message_start.message.id", "high")
@@ -1326,6 +1332,7 @@ class SseTap:
                     slot["arguments"] = obj.get("arguments", slot["arguments"])
                     slot["name"] = obj.get("name") or slot.get("name")
             elif et == "response.completed" and isinstance(obj.get("response"), dict):
+                self.complete = True
                 r = obj["response"]
                 for item in r.get("output") or []:
                     self._extract("response.output_item.done", {"type": "response.output_item.done", "item": item})
@@ -1748,14 +1755,18 @@ class AuditHandler(BaseHTTPRequestHandler):
         tap.flush()
         record["response"]["body_bytes"] = resp_bytes
         record["response"]["sse"] = is_sse
+        if is_sse:
+            record["response"]["sse_complete"] = tap.complete
         if stream_error:
             record["error"] = "upstream_stream_error"
-            record["response_truncated_by"] = stream_error
+            if not (is_sse and tap.complete):
+                record["response_truncated_by"] = stream_error
         if response_over_limit:
             record["response"]["body_truncated"] = True
         if client_gone:
             record["client_disconnect"] = True
-            record["response_truncated_by"] = "client_disconnect"
+            if not (is_sse and tap.complete):
+                record["response_truncated_by"] = "client_disconnect"
 
         # ---- ID 分类 ----
         ids = list(tap.ids)
