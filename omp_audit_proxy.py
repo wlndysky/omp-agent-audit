@@ -22,6 +22,7 @@ omp_audit_proxy.py — 本地（127.0.0.1-only）LLM API 流式审计反向代�
 
 输出：audit.jsonl 保存报文与 ChatML；tools.jsonl 单独保存 OMP 内置/MCP 工具轨迹。
 工具结果包含工具名、参数、返回内容、调用/结果 exchange ID、来源与重复历史标记。
+直接运行本脚本可启动代理和 OMP，使用临时扩展，不修改原模型配置。
 路由可用 --route /local/=https://upstream.example/v1=openai-completions 自定义。
 
 安全：
@@ -46,14 +47,19 @@ import argparse
 import base64
 from collections import OrderedDict
 import hashlib
+import hmac
 import http.client
 import json
 import logging
 import logging.handlers
 import os
+import secrets
+import shutil
 import ssl
 import socket
 import sys
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -69,6 +75,74 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 DEFAULT_ROUTES: list[tuple[str, str, str]] = []
 
 HEALTH_PATH = "/__audit/health"
+CONTROL_PATH = "/__audit/routes"
+SUPPORTED_APIS = {"anthropic-messages", "openai-completions", "openai-responses"}
+
+# Written only into a temporary local directory; never installed into OMP.
+# Runtime registration changes this process's model registry, not models.yml.
+LAUNCHER_EXTENSION = r'''
+export default function (pi) {
+  const root = process.env.OMP_AUDIT_CONTROL_URL;
+  const token = process.env.OMP_AUDIT_CONTROL_TOKEN;
+  const supported = new Set(["anthropic-messages", "openai-completions", "openai-responses"]);
+  pi.on("session_start", async (_event, ctx) => {
+    try {
+      if (!root || !token) throw new Error("Missing private launcher connection");
+      const grouped = new Map();
+      for (const model of ctx.modelRegistry.getAll()) {
+        const group = grouped.get(model.provider) || [];
+        group.push(model);
+        grouped.set(model.provider, group);
+      }
+      const entries = [];
+      let skipped = 0;
+      for (const [provider, models] of grouped) {
+        const endpoints = new Set(models.map(m => JSON.stringify([m.api, m.baseUrl])));
+        const model = models[0];
+        if (endpoints.size !== 1 || !supported.has(model.api) || !model.baseUrl) {
+          skipped++;
+          continue;
+        }
+        // Parent-prepared child registries may already carry these overrides.
+        if (model.baseUrl.startsWith(root + "/_audit/")) continue;
+        entries.push({provider, api: model.api, upstream: model.baseUrl});
+      }
+      const response = await fetch(root + "/__audit/routes", {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "Authorization": "Bearer " + token},
+        body: JSON.stringify({routes: entries}),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) throw new Error("Audit route registration failed: " + response.status);
+      const payload = await response.json();
+      for (const route of payload.routes) {
+        pi.registerProvider(route.provider, {baseUrl: route.baseUrl});
+      }
+      if (ctx.model) {
+        const routed = ctx.modelRegistry.find(ctx.model.provider, ctx.model.id);
+        if (!routed || !routed.baseUrl.startsWith(root + "/_audit/")) {
+          throw new Error("The selected provider cannot be safely auto-routed; use an explicit route instead");
+        }
+        if (!(await pi.setModel(routed))) throw new Error("Unable to activate the routed model");
+      }
+      const ready = await fetch(root + "/__audit/routes", {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "Authorization": "Bearer " + token},
+        body: JSON.stringify({routes: [], ready: true}),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!ready.ok) throw new Error("Audit readiness acknowledgement failed");
+      process.stderr.write("[audit] temporary routing ready: " + payload.routes.length +
+        " provider(s); " + skipped + " unsupported/mixed provider(s) unchanged.\n");
+    } catch (error) {
+      process.stderr.write("[audit] startup failed; stopping this OMP session: " + String(error) + "\n");
+      ctx.shutdown();
+      // Print-mode shutdown hooks can be no-ops. Do not continue un-audited.
+      process.exit(1);
+    }
+  });
+}
+'''
 
 # 脱敏头（小写比较）
 SENSITIVE_HEADERS = {
@@ -145,6 +219,8 @@ class JsonlLogger:
     def write(self, record: dict) -> None:
         line = json.dumps(record, ensure_ascii=False, default=str)
         with self.lock:
+            if self._fh.closed:
+                return
             try:
                 if self._fh.tell() > self.max_bytes:
                     self._rotate()
@@ -772,6 +848,8 @@ class AuditHandler(BaseHTTPRequestHandler):
     routes: list[Route] = []
     logger: JsonlLogger | None = None
     tool_logger: JsonlLogger | None = None
+    control_token: str | None = None
+    route_lock = threading.Lock()
     upstream_connect_timeout = 30.0
     verbose = False
 
@@ -806,6 +884,9 @@ class AuditHandler(BaseHTTPRequestHandler):
         return b""
 
     def _handle(self) -> None:
+        if self.path == CONTROL_PATH:
+            self._register_routes()
+            return
         record: dict = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
             "ts_epoch": time.time(),
@@ -843,6 +924,64 @@ class AuditHandler(BaseHTTPRequestHandler):
                                             "route": record.get("route"), "protocol": record.get("protocol"),
                                             "classification_id": grouping.get("primary_id"),
                                             "conversation_hint": record.get("conversation_hint"), **event})
+
+    def _control_reply(self, status: int, payload: dict) -> None:
+        data = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(data)
+        self.close_connection = True
+
+    def _register_routes(self) -> None:
+        # Control traffic has no model content and must never log its token.
+        if self.command != "POST" or not self.control_token:
+            self._control_reply(404, {"error": "not_found"})
+            return
+        provided = self.headers.get("Authorization", "").encode()
+        if not hmac.compare_digest(provided, ("Bearer " + self.control_token).encode()):
+            self._control_reply(403, {"error": "forbidden"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if self.headers.get("Transfer-Encoding") or not 0 < length <= 2 * 1024 * 1024:
+                raise ValueError("Invalid control request length")
+            body = json.loads(self.rfile.read(length))
+            entries = body.get("routes")
+            if not isinstance(entries, list) or len(entries) > 2048:
+                raise ValueError("Invalid route list")
+            routes, response = [], []
+            providers = set()
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("Invalid route entry")
+                provider, api, upstream = (entry.get(k) for k in ("provider", "api", "upstream"))
+                if not isinstance(provider, str) or not provider or provider in providers:
+                    raise ValueError("Missing or duplicate provider")
+                if api not in SUPPORTED_APIS or not isinstance(upstream, str):
+                    raise ValueError("Unsupported route protocol")
+                parsed = urllib.parse.urlsplit(upstream)
+                if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                        or parsed.username or parsed.password or parsed.query or parsed.fragment):
+                    raise ValueError("Upstream must be an HTTP(S) base URL without credentials, query or fragment")
+                if parsed.hostname in ("localhost", "127.0.0.1", "::1") and parsed.port == self.server.server_port:
+                    raise ValueError("Refusing a proxy routing loop")
+                providers.add(provider)
+                key = hashlib.sha256(_canon([provider, api, upstream]).encode()).hexdigest()[:20]
+                prefix = "/_audit/" + key + "/"
+                routes.append(Route(prefix, upstream, api))
+                response.append({"provider": provider,
+                                 "baseUrl": f"http://127.0.0.1:{self.server.server_port}" + prefix.rstrip("/")})
+            with self.route_lock:
+                existing = {route.prefix for route in self.routes}
+                self.routes.extend(route for route in routes if route.prefix not in existing)
+            if body.get("ready") is True and hasattr(self.server, "audit_ready"):
+                self.server.audit_ready.set()
+            self._control_reply(200, {"routes": response})
+        except (ValueError, TypeError, AttributeError):
+            self._control_reply(400, {"error": "invalid_routes"})
 
     def _proxy(self, record: dict) -> None:
         raw_path = self.path
@@ -1143,19 +1282,79 @@ class AuditHTTPServer(ThreadingHTTPServer):
 # --------------------------------------------------------------------------
 
 
+def launch_omp(server, handler, executable: str, omp_args: list[str]) -> int:
+    """Run OMP with a disposable extension and child-only environment changes."""
+    with tempfile.TemporaryDirectory(prefix="omp-audit-launch-") as directory:
+        extension = os.path.join(directory, "audit-route.ts")
+        with open(extension, "w", encoding="utf-8") as fh:
+            fh.write(LAUNCHER_EXTENSION)
+        try:
+            os.chmod(extension, 0o600)
+        except OSError:
+            pass
+        environment = os.environ.copy()
+        environment["OMP_AUDIT_CONTROL_URL"] = f"http://127.0.0.1:{server.server_port}"
+        environment["OMP_AUDIT_CONTROL_TOKEN"] = handler.control_token
+        # Only this child gets the compression setting; the user's environment
+        # and other OMP processes remain untouched.
+        environment["PI_CODEX_ZSTD"] = "0"
+        server.audit_ready = threading.Event()
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        child = None
+        try:
+            # Inherit the terminal: this remains an ordinary interactive OMP.
+            child = subprocess.Popen([executable, "--extension", extension, *omp_args], env=environment)
+            while True:
+                try:
+                    status = child.wait()
+                    break
+                except KeyboardInterrupt:
+                    # Ctrl+C also reaches OMP, where it may mean "cancel turn".
+                    # Keep the proxy alive until OMP actually exits.
+                    continue
+            if not server.audit_ready.is_set():
+                print("[audit] OMP exited before temporary routing was ready; original configuration was not changed.", file=sys.stderr)
+                return status or 1
+            return status
+        finally:
+            if child is not None and child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            server.shutdown()
+            worker.join(timeout=5)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="OMP 本地模型审计代理（127.0.0.1 only）")
     ap.add_argument("--host", default="127.0.0.1", help="绑定地址（默认 127.0.0.1；不要改成 0.0.0.0）")
-    ap.add_argument("--port", type=int, default=8787)
-    ap.add_argument("--log", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit-logs", "audit.jsonl"))
+    ap.add_argument("--port", type=int, help="代理模式默认 8787；一键启动默认自动选择空闲端口")
+    ap.add_argument("--log", help="审计 JSONL；一键启动默认按次分目录")
     ap.add_argument("--log-max-bytes", type=int, default=64 * 1024 * 1024)
     ap.add_argument("--log-backups", type=int, default=5)
     ap.add_argument("--tools-log", help="独立工具轨迹 JSONL，默认与 --log 同目录下的 tools.jsonl")
     ap.add_argument("--route", action="append", default=[],
-                    help="上游路由 prefix=upstream 或 prefix=upstream=hint，可重复；至少配置一个")
+                    help="上游路由 prefix=upstream 或 prefix=upstream=hint，可重复；仅代理模式至少配置一个")
     ap.add_argument("--upstream-connect-timeout", type=float, default=30.0)
     ap.add_argument("--verbose", action="store_true")
-    args = ap.parse_args(argv)
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--launch-omp", action="store_true", help="启动 OMP 并自动临时路由；没有 --route 时默认启用")
+    mode.add_argument("--proxy-only", action="store_true", help="仅运行代理，需要 --route")
+    ap.add_argument("--omp-executable", default="omp", help="OMP 可执行文件名或完整路径")
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    split = arguments.index("--") if "--" in arguments else len(arguments)
+    args = ap.parse_args(arguments[:split])
+    omp_args = arguments[split + 1:]
+    launch = args.launch_omp or (not args.route and not args.proxy_only)
+    if omp_args and not launch:
+        ap.error("OMP 参数需要一键启动模式；使用 --launch-omp")
+    executable = shutil.which(args.omp_executable) if launch else None
+    if launch and not executable:
+        ap.error("未找到 OMP；请安装 OMP 或用 --omp-executable 指定完整路径")
 
     if args.host != "127.0.0.1":
         print("[audit] 拒绝绑定非 127.0.0.1 地址（审计日志含敏感内容）", file=sys.stderr)
@@ -1172,19 +1371,32 @@ def main(argv=None) -> int:
             print(f"[audit] 无效路由: {spec}", file=sys.stderr)
             return 2
 
-    if not routes:
+    if not routes and not launch:
         ap.error("请使用 --route /api/=https://upstream.example/v1=openai-completions 配置自己的上游")
 
+    if args.log is None:
+        folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit-logs")
+        if launch:
+            folder = os.path.join(folder, time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:8])
+        args.log = os.path.join(folder, "audit.jsonl")
     tools_path = args.tools_log or os.path.join(os.path.dirname(os.path.abspath(args.log)), "tools.jsonl")
     if os.path.normcase(os.path.abspath(tools_path)) == os.path.normcase(os.path.abspath(args.log)):
         ap.error("--tools-log 不能与 --log 使用同一个文件")
-    AuditHandler.routes = routes
-    AuditHandler.logger = JsonlLogger(args.log, args.log_max_bytes, args.log_backups)
-    AuditHandler.tool_logger = JsonlLogger(tools_path, args.log_max_bytes, args.log_backups)
-    AuditHandler.upstream_connect_timeout = args.upstream_connect_timeout
-    AuditHandler.verbose = args.verbose
+    handler = type("ConfiguredAuditHandler", (AuditHandler,), {})
+    handler.routes = routes
+    handler.logger = JsonlLogger(args.log, args.log_max_bytes, args.log_backups)
+    handler.tool_logger = JsonlLogger(tools_path, args.log_max_bytes, args.log_backups)
+    handler.upstream_connect_timeout = args.upstream_connect_timeout
+    handler.verbose = args.verbose
+    handler.control_token = secrets.token_urlsafe(32) if launch else None
 
-    server = AuditHTTPServer((args.host, args.port), AuditHandler)
+    port = args.port if args.port is not None else (0 if launch else 8787)
+    try:
+        server = AuditHTTPServer((args.host, port), handler)
+    except OSError:
+        handler.logger.close()
+        handler.tool_logger.close()
+        raise
     server.daemon_threads = True
     print(f"[audit] listening on http://{args.host}:{server.server_address[1]}", file=sys.stderr)
     print(f"[audit] log: {args.log}", file=sys.stderr)
@@ -1192,13 +1404,15 @@ def main(argv=None) -> int:
     for r in routes:
         print(f"[audit] route {r.prefix} -> {r.upstream} ({r.hint})", file=sys.stderr)
     try:
+        if launch:
+            return launch_omp(server, handler, executable, omp_args)
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
-        AuditHandler.logger.close()
-        AuditHandler.tool_logger.close()
+        handler.logger.close()
+        handler.tool_logger.close()
     return 0
 
 

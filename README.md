@@ -19,15 +19,36 @@ A local LLM API audit proxy for OMP built-in tools, MCP tools, and model context
 
 ### 快速开始
 
-需要 Python 3.10+，无需安装第三方依赖。
+需要 Python 3.10+ 和已安装、可在命令行运行的 OMP。Python 无需第三方依赖。
 
 ```bash
 git clone https://github.com/wlndysky/omp-agent-audit.git
 cd omp-agent-audit
-python omp_audit_proxy.py --route "/api/=https://upstream.example/v1=openai-completions"
+python omp_audit_proxy.py
 ```
 
-`upstream.example` 是占位地址，运行前必须替换成自己的真实上游。公开版本没有默认路由，至少提供一个 `--route`。
+这一条命令会自动选择空闲端口、启动代理、生成临时扩展，再启动 OMP。扩展读取 OMP 当前有效的模型目录，仅在此次进程内覆盖上游地址，复用原来的模型和凭据；不修改 `models.yml`、不安装持久扩展、不修改父进程环境。其他已经打开的 OMP 窗口以及之后直接运行的 `omp` 不会自动使用该代理。
+
+正常退出 OMP 后，启动器会关闭代理并删除临时扩展。OMP 自身仍按平常方式保存会话、使用记录等；这不是一个禁写沙箱。进程被强制结束时，临时文件的清理不保证执行。
+
+需要给 OMP 传入参数，在 `--` 后照常填写：
+
+```bash
+python omp_audit_proxy.py -- --continue
+python omp_audit_proxy.py -- --model "provider/model-id"
+```
+
+`--omp-executable` 可指定 OMP 可执行文件完整路径。脚本可以放在 NAS 共享目录，但它在哪台电脑执行，就在哪台电脑启动代理和 OMP。
+
+### 仅代理模式（可选）
+
+如果希望自行管理客户端连接，原来的显式路由方式仍然可用：
+
+```bash
+python omp_audit_proxy.py --proxy-only --route "/api/=https://upstream.example/v1=openai-completions"
+```
+
+`upstream.example` 是占位地址，需要替换成真实上游。只有这种仅代理方式才需要手动调整客户端地址。
 
 在 OMP 的对应 provider 配置中，**只将 `baseUrl` 换成 `http://127.0.0.1:8787/api`**；保留原来的模型 ID、API 类型和认证设置。此例中，请求 `/api/chat/completions` 会转发到上游 `/v1/chat/completions`。
 
@@ -47,7 +68,7 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 
 ### 日志与操作
 
-默认输出到脚本旁的 `audit-logs/`：
+一键启动默认输出到脚本旁的 `audit-logs/<本次运行ID>/`，各次运行隔离；仅代理模式默认使用 `audit-logs/`：
 
 - `audit.jsonl`：每次 HTTP 交换的请求/响应、解析后的 SSE 事件、ID 分类、ChatML 和工具轨迹。
 - `tools.jsonl`：每条工具事件单独一行，便于检索工具名、参数、结果和跨轮关联。
@@ -61,15 +82,17 @@ python omp_audit_proxy.py --help
 python -B -X utf8 test_audit_proxy.py
 ```
 
-- `--port`：默认 `8787`；按 `Ctrl+C` 停止。
+- `--port`：一键启动默认选择空闲端口，仅代理模式默认 `8787`。
+- 一键模式下按 OMP 自身方式退出，代理随后停止；`Ctrl+C` 保留 OMP 的取消当前轮次语义。仅代理模式用 `Ctrl+C` 停止。
 - `--log` / `--tools-log`：分别指定完整审计和工具轨迹文件。
 - `--log-max-bytes` / `--log-backups`：默认每个日志约 64 MiB 后轮转，保留 5 个备份；不是永久归档。
 - `--upstream-connect-timeout`：默认 30 秒；响应开始后取消该连接的 socket 读超时。
 
-测试使用本机临时端口和模拟上游，不需要 API Key，不调用真实模型或真实 MCP 服务；验证报文转发、工具关联和日志输出，不代表已验证所有 provider 或用户的 agent 环境。
+默认测试使用本机临时端口和模拟上游，不需要 API Key，不调用真实模型或真实 MCP 服务。加 `--real-omp` 会额外启动已安装的真实 OMP，使用临时独立配置和本机假上游，验证一次真实 read 工具调用、配置未被重写，以及不安全路由在推理前停止。不代表已验证所有 provider、Vibe 子代理路径或用户的完整 agent 环境。
 
 ### 隐私与限制
 
+- 自动路由只覆盖上述三类 API，且要求同一 provider 的聊天模型使用同一上游地址和 API。其他或混合端点 provider 会明确提示未覆盖；启动时所选模型无法安全路由则停止，不会悄悄直接调用。运行中切换到未覆盖的 provider 不会自动获得审计覆盖。
 - 只对指定认证头、Cookie 和敏感查询参数脱敏。**正文中的密码、源码、Flag、文件路径、工具输出等仍可能原样出现，分享前必须审查。**
 - `.gitignore` 排除日志、缓存和常见本地配置，但不能清除已经提交的文件或 Git 历史。
 - 使用正常的 TLS 证书校验，仅允许回环绑定；回环绑定不能阻止其他本机进程访问。
@@ -92,15 +115,36 @@ python -B -X utf8 test_audit_proxy.py
 
 ### Quick start
 
-Python 3.10+ is required. No third-party dependencies.
+Python 3.10+ and an installed OMP executable on PATH are required. No third-party Python dependencies.
 
 ```bash
 git clone https://github.com/wlndysky/omp-agent-audit.git
 cd omp-agent-audit
-python omp_audit_proxy.py --route "/api/=https://upstream.example/v1=openai-completions"
+python omp_audit_proxy.py
 ```
 
-Replace the placeholder `upstream.example` with your actual upstream before running. At least one `--route` is required; the public version has no default upstream.
+This selects a free local port, starts the proxy, creates a temporary extension, and launches OMP. The extension reads OMP's effective model catalog and overrides provider URLs only in this process, keeping the existing models and credentials. It does not edit `models.yml`, install a persistent extension, or change the parent environment. Other OMP windows and later plain `omp` launches do not inherit the proxy.
+
+When OMP exits normally, the launcher stops the proxy and removes the temporary extension. OMP itself still saves sessions and usage information as usual; this is not a no-write sandbox. Cleanup is not guaranteed if the process is forcibly killed.
+
+Pass OMP arguments after `--`:
+
+```bash
+python omp_audit_proxy.py -- --continue
+python omp_audit_proxy.py -- --model "provider/model-id"
+```
+
+Use `--omp-executable` for an explicit executable path. The script may live on a NAS share; the proxy and OMP run on the machine executing it.
+
+### Proxy-only mode (optional)
+
+Explicit routes remain available if you prefer managing the client connection yourself:
+
+```bash
+python omp_audit_proxy.py --proxy-only --route "/api/=https://upstream.example/v1=openai-completions"
+```
+
+Replace `upstream.example` with your actual upstream. Only this proxy-only mode requires manually changing the client endpoint.
 
 For the corresponding OMP provider, change **only `baseUrl` to `http://127.0.0.1:8787/api`**. Keep its model ID, API type, and authentication settings unchanged. In this example, `/api/chat/completions` is forwarded to `/v1/chat/completions` upstream.
 
@@ -120,7 +164,7 @@ Only the local prefix is replaced. The proxy does not deduplicate `/v1`; match y
 
 ### Logs and operation
 
-By default, files are written to `audit-logs/` beside the script:
+One-command launches write to `audit-logs/<run-id>/` beside the script, isolating each run. Proxy-only mode defaults to `audit-logs/`:
 
 - `audit.jsonl`: HTTP exchanges, parsed SSE events, ID classification, derived ChatML, and tool traces.
 - `tools.jsonl`: one tool event per line, including names, arguments, results, and correlation fields.
@@ -134,15 +178,17 @@ python omp_audit_proxy.py --help
 python -B -X utf8 test_audit_proxy.py
 ```
 
-- `--port` defaults to `8787`. Stop with `Ctrl+C`.
+- `--port` selects a free port in launcher mode and defaults to `8787` in proxy-only mode.
+- Exit OMP normally to stop its proxy. In launcher mode, `Ctrl+C` retains OMP's cancel-turn behavior; in proxy-only mode it stops the proxy.
 - `--log` and `--tools-log` select the two output files.
 - `--log-max-bytes` and `--log-backups` default to rotation after approximately 64 MiB per file and five backups. Logs are not permanent archives.
 - `--upstream-connect-timeout` defaults to 30 seconds; the socket read timeout is removed once the response starts.
 
-Tests use temporary loopback ports and a mock upstream. They require no API key and do not call real models or real MCP servers. Passing them does not certify every provider or an individual agent deployment.
+Default tests use temporary loopback ports and a mock upstream, with no API key or real model/MCP server calls. Add `--real-omp` to exercise the installed OMP against an isolated temporary configuration and a local fake provider: it performs a real read tool call, checks that model configuration is unchanged, and verifies unsafe routing stops before inference. Passing does not certify every provider, Vibe subagent path, or a user's full deployment.
 
 ### Privacy and limitations
 
+- Automatic routing covers the three APIs above and requires a uniform chat-model endpoint and API within each provider. Unsupported or mixed-endpoint providers are reported as uncovered. An unsupported selection at startup stops the child instead of silently calling it directly. Switching to an uncovered provider later does not automatically add audit coverage.
 - Selected authentication headers, cookies, and sensitive query parameters are redacted. **Bodies may still contain passwords, source code, flags, paths, and tool output. Review logs before sharing.**
 - `.gitignore` excludes logs, caches, and common local configuration; it cannot erase tracked files or existing Git history.
 - Normal TLS certificate verification is used and non-loopback binding is refused. Loopback binding is not access control against other local processes.

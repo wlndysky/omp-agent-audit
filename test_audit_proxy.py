@@ -11,12 +11,14 @@ import http.client
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 import omp_audit_proxy as ap
 
@@ -175,10 +177,10 @@ def tool_regressions():
     checks = []
     checks.append(("public_distribution_has_no_private_upstreams", ap.DEFAULT_ROUTES == []))
     unconfigured = subprocess.run([
-        sys.executable, "-B", "-X", "utf8", os.path.abspath(ap.__file__),
+        sys.executable, "-B", "-X", "utf8", os.path.abspath(ap.__file__), "--proxy-only",
     ], capture_output=True, text=True, encoding="utf-8", timeout=10,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-    checks.append(("startup_requires_explicit_route", unconfigured.returncode == 2
+    checks.append(("proxy_only_requires_explicit_route", unconfigured.returncode == 2
                    and "--route" in unconfigured.stderr and "listening" not in unconfigured.stderr))
     ant = {"messages": [
         {"role": "assistant", "content": [
@@ -303,6 +305,160 @@ def cli_smoke(mock_port, body):
             process.terminate()
             process.wait(timeout=10)
             process.stderr.close()
+
+
+def launcher_regressions():
+    handler = type("LauncherTestHandler", (ap.AuditHandler,), {
+        "routes": [], "control_token": "synthetic-control-token", "logger": None, "tool_logger": None,
+    })
+    server = ap.AuditHTTPServer(("127.0.0.1", 0), handler)
+    observations = {}
+    original_environment = dict(os.environ)
+    checks = []
+
+    def register(body, auth="Bearer synthetic-control-token"):
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request("POST", ap.CONTROL_PATH, body=json.dumps(body),
+                           headers={"Content-Type": "application/json", "Authorization": auth})
+        response = connection.getresponse()
+        status, output = response.status, json.loads(response.read())
+        connection.close()
+        return status, output
+
+    class Child:
+        def __init__(self, args, env):
+            observations.update(args=args, env=env, extension=args[2])
+            with open(args[2], encoding="utf-8") as fh:
+                observations["source"] = fh.read()
+
+        def wait(self, **kwargs):
+            checks.append(("launcher_control_rejects_other_clients", register({"routes": []}, "Bearer wrong")[0] == 403))
+            route = {"provider": "fixture", "api": "openai-completions", "upstream": "https://upstream.example/v1"}
+            checks.append(("launcher_control_rejects_url_credentials", register({"routes": [
+                {**route, "upstream": "https://name:secret@upstream.example/v1"}]})[0] == 400))
+            checks.append(("launcher_control_rejects_self_loop", register({"routes": [
+                {**route, "upstream": f"http://127.0.0.1:{server.server_port}"}]})[0] == 400))
+            status, response = register({"routes": [route], "ready": True})
+            again_status, again = register({"routes": [route]})
+            checks.append(("launcher_routes_registered_idempotently", status == again_status == 200
+                           and response == again and len(handler.routes) == 1))
+            return 0
+
+        def poll(self):
+            return 0
+
+    try:
+        with patch.object(ap.subprocess, "Popen", Child):
+            status = ap.launch_omp(server, handler, "omp", ["--no-session", "--thinking", "high"])
+        checks.extend([
+            ("launcher_preserves_omp_arguments", observations["args"][3:] == ["--no-session", "--thinking", "high"]),
+            ("launcher_removes_temporary_extension", not os.path.exists(observations["extension"])),
+            ("launcher_environment_is_child_only", dict(os.environ) == original_environment
+             and observations["env"]["OMP_AUDIT_CONTROL_TOKEN"] == "synthetic-control-token"),
+            ("launcher_returns_child_exit_code", status == 0),
+            ("launcher_extension_contains_no_instance_secret", "synthetic-control-token" not in observations["source"]),
+        ])
+    finally:
+        server.server_close()
+    return checks
+
+
+def real_omp_smoke():
+    """Optional real OMP + fake provider, using an isolated temporary agent dir."""
+    if not shutil.which("omp"):
+        raise RuntimeError("--real-omp requires an installed omp executable")
+    with tempfile.TemporaryDirectory(prefix="omp-audit-real-") as directory:
+        agent_dir = os.path.join(directory, "agent")
+        workspace = os.path.join(directory, "workspace")
+        os.makedirs(agent_dir)
+        os.makedirs(workspace)
+        fixture = os.path.join(workspace, "fixture.txt")
+        with open(fixture, "w", encoding="utf-8") as fh:
+            fh.write("AUDIT_READ_OK\n")
+        requests = []
+
+        class Provider(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.append(body)
+                messages = body.get("messages", [])
+                completed = any(m.get("role") == "tool" for m in messages)
+                delta = {"role": "assistant"}
+                if completed:
+                    delta["content"] = "AUDIT_LOCAL_OK"
+                else:
+                    delta["tool_calls"] = [{"index": 0, "id": "call_fixture", "type": "function",
+                        "function": {"name": "read", "arguments": json.dumps({"path": fixture})}}]
+                chunks = [
+                    {"id": "chatcmpl-fixture-" + str(len(requests)), "object": "chat.completion.chunk",
+                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+                    {"id": "chatcmpl-fixture-" + str(len(requests)), "object": "chat.completion.chunk",
+                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop" if completed else "tool_calls"}],
+                     "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+                ]
+                data = ("".join("data: " + json.dumps(c) + "\n\n" for c in chunks) + "data: [DONE]\n\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        mock = ap.AuditHTTPServer(("127.0.0.1", 0), Provider)
+        threading.Thread(target=mock.serve_forever, daemon=True).start()
+        models_path = os.path.join(agent_dir, "models.yml")
+        configuration = {"providers": {"audit-fixture": {
+            "baseUrl": f"http://127.0.0.1:{mock.server_port}/v1", "api": "openai-completions", "auth": "none",
+            "models": [{"id": "fixture", "name": "Audit Fixture", "reasoning": False,
+                        "input": ["text"], "contextWindow": 32768, "maxTokens": 1024}],
+        }}}
+        original = json.dumps(configuration).encode()
+        with open(models_path, "wb") as fh:
+            fh.write(original)
+        environment = os.environ.copy()
+        environment.pop("OMP_PROFILE", None)
+        environment["PI_CODING_AGENT_DIR"] = agent_dir
+        logpath = os.path.join(directory, "logs", "audit.jsonl")
+        try:
+            command = [
+                sys.executable, "-B", "-u", "-X", "utf8", os.path.abspath(ap.__file__), "--log", logpath, "--",
+                "--cwd", workspace, "--no-extensions", "--no-skills", "--no-rules", "--no-lsp",
+                "--no-session", "--no-title", "--tools", "read", "--model", "audit-fixture/fixture",
+                "--thinking", "off", "-p", "Read fixture.txt with the read tool, then report its contents.",
+            ]
+            run = subprocess.run(command, env=environment, cwd=workspace, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=55, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            if run.returncode != 0:
+                raise RuntimeError("Real OMP smoke failed: " + run.stderr[-6500:] + run.stdout[-2500:])
+            with open(models_path, "rb") as fh:
+                unchanged = fh.read() == original
+            with open(os.path.join(directory, "logs", "tools.jsonl"), encoding="utf-8") as fh:
+                events = [json.loads(line) for line in fh if line.strip()]
+            tool_results = [e for e in events if e.get("event") == "tool_result"]
+            before_failed_run = len(requests)
+            configuration["providers"]["audit-fixture"]["models"].append({
+                "id": "other", "baseUrl": f"http://127.0.0.1:{mock.server_port}/different/v1"})
+            with open(models_path, "w", encoding="utf-8") as fh:
+                json.dump(configuration, fh)
+            failed = subprocess.run(command, env=environment, cwd=workspace, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=55,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            return [
+                ("real_omp_launcher_exit_success", run.returncode == 0 and "AUDIT_LOCAL_OK" in run.stdout),
+                ("real_omp_configuration_unchanged", unchanged),
+                ("real_omp_read_tool_audited", any(e.get("tool_name") == "read"
+                  and "AUDIT_READ_OK" in str(e.get("content")) and e.get("correlated") for e in tool_results)),
+                ("real_omp_two_model_rounds_forwarded", len(requests) >= 2),
+                ("real_omp_unsafe_routing_stops_before_inference", failed.returncode != 0
+                 and len(requests) == before_failed_run and "cannot be safely auto-routed" in failed.stderr),
+            ]
+        finally:
+            mock.shutdown()
+            mock.server_close()
 
 
 def main():
@@ -535,6 +691,9 @@ def main():
         e.get("tool_name") == "mcp__audit_echo" and e.get("arguments") == {"text": "pong"}
         and e.get("content") == "pong" for e in tool_lines)))
     results.extend(tool_regressions())
+    results.extend(launcher_regressions())
+    if "--real-omp" in sys.argv:
+        results.extend(real_omp_smoke())
 
     fb_ids = [r["classification"]["primary_id"] for r in noid_records]
     results.append(("fallback_used", all(r["classification"]["confidence"] == "low" for r in noid_records)))
