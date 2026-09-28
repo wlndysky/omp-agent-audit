@@ -13,7 +13,7 @@ A local LLM API audit proxy for OMP built-in tools, MCP tools, and model context
 - 单文件 Python，纯标准库，仅监听 `127.0.0.1`。
 - 支持 Anthropic Messages、OpenAI-compatible Chat Completions 和 Responses 的 JSON / SSE 报文。
 - 记录请求、响应、API 返回的 thinking/reasoning、工具调用参数及后续上下文回传的结果。
-- 默认只写一个追加式 `sessions-rl.jsonl`：优先按真实 response ID / previous_response_id 关联，ID 每轮变化且无法关联时按 system → 首条 user 的 CRC32 分组；SHA-256 校验锚点，避免 CRC32 碰撞误合并。请求 ID 不冒充响应 ID。
+- 按稳定分组写追加式 `session-<分组ID>-rl.jsonl`：优先按真实 response ID / previous_response_id 关联，ID 每轮变化且无法关联时按 system → 首条 user 的 CRC32 分组；SHA-256 校验锚点，避免 CRC32 碰撞误合并。请求 ID 不冒充响应 ID。
 - 从请求历史恢复 OMP/MCP 工具名、参数和结果；重复历史会标记，无法确定的原始调用来源保留为空。
 - 不内置个人模型、上游地址、API Key 或 agent 配置。
 
@@ -76,28 +76,28 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 
 一键启动默认输出到脚本旁的 `audit-logs/<本次运行ID>/`。Windows 启动脚本默认输出到脚本目录的上一级。
 
-- `sessions-rl.jsonl`：唯一的正文日志，每次交换追加一行 `schema_version: 2` 增量。包含请求、解析后的响应/SSE、ChatML、独立 `thinking` 字段及工具参数/结果。
+- `session-<分组ID>-rl.jsonl`：每个稳定分组一份正文日志，每次交换追加一行 `schema_version: 2` 增量。包含请求、解析后的响应/SSE、ChatML、独立 `thinking` 字段及工具参数/结果。
 - `audit.jsonl`：交换 ID、流 ID、状态、耗时和 THINK 字符数等小型索引，不重复保存完整上下文。
 - `tools.jsonl`：工具事件索引，通过 `exchange_id` 和 `tool_trace_index` 定位正文，不重复写大段工具结果；已标记的历史重播不再写索引。
 
 每个流首次保存基线，后续只追加相对上一条的 `set/remove/append/splice` 变化，不反复写全量对话，也不整体覆盖累计 JSON。保留原始结构，文件原有字节不改写；`state_sha256` 校验重建结果。每行有 `base_exchange_id`、`response_id` 和明确的 `thinking.present/characters`。无 THINK 的响应如实标为 false，不生成思考内容。
 
-真实 response ID 是响应关联键，不一定是会话 ID。Anthropic/Chat Completions 经常每轮换 ID，因此无法通过响应链关联时用初始上下文 CRC32 分流；所有流都在同一个 JSONL 中。相同 CRC32 但不同 SHA-256 锚点会分开；完全相同的初始上下文仍只是分组线索，不是独立运行或分支的严格身份。
+真实 response ID 是响应关联键，不一定是会话 ID。Anthropic/Chat Completions 经常每轮换 ID，因此无法通过响应链关联时用初始上下文 CRC32 分流；分组写入各自文件，例如 `session-crc32-1a2b3c4d-rl.jsonl`；能关联的响应链沿用首个分组文件，无初始上下文时文件名包含 response ID。每轮新 response ID 不会强制生成新文件。相同 CRC32 但不同 SHA-256 锚点会分开；完全相同的初始上下文仍只是分组线索，不是独立运行或分支的严格身份。
 
-线程和进程共享文件锁。重启按日志重放恢复状态，并按 exchange ID 防止重复导出；后续只读其他写入者新增的尾部。损坏或未写完的末行拒绝覆盖。异常中断的响应保留已捕获内容和断连标记。日志写入发生在响应结束/中断时，不是每个 token 立刻落盘。启动时会重放现有日志，内存保留每个流最后的状态及关联索引。
+线程和进程共享文件锁。重启按日志重放恢复状态，并按 exchange ID 防止重复导出；后续只读其他写入者新增的尾部；按提交序号合并多个文件，单个文件也可独立重放。损坏或未写完的末行拒绝覆盖。异常中断的响应保留已捕获内容和断连标记。日志写入发生在响应结束/中断时，不是每个 token 立刻落盘。启动时会重放现有日志，内存保留每个流最后的状态及关联索引。
 
 需要读取完整交换时按需重放，不要重新落盘每轮全量快照：
 
 ```python
 from omp_audit_proxy import iter_session_records
 
-for exchange in iter_session_records("sessions-rl.jsonl"):
+for exchange in iter_session_records("/path/to/logs"):
     messages = exchange.get("chatml", {}).get("messages", [])
     # exchange["tool_trace"] contains arguments and results.
     # Assistant messages keep API-visible reasoning in message["thinking"].
 ```
 
-旧版文件不会自动转换或删除；旧程序不会热更新，部署后须正常重新启动。工具记录不等于执行成功；工具结果必须由客户端回传才可被代理记录。原始交换结构经重放保留，ChatML 仍是有损派生视图。
+旧版 `sessions-rl.jsonl` 不会自动转换或删除，可传入其文件路径单独重放；目录重放只读取新命名的分类文件。旧程序不会热更新，部署后须正常重新启动；正在运行的旧进程继续使用原文件名。工具记录不等于执行成功；工具结果必须由客户端回传才可被代理记录。原始交换结构经重放保留，ChatML 仍是有损派生视图。
 
 ```bash
 python omp_audit_proxy.py --help
@@ -133,7 +133,7 @@ python -B -X utf8 test_audit_proxy.py --real-omp
 - One Python file, standard library only, bound to `127.0.0.1`.
 - JSON and SSE handling for Anthropic Messages, OpenAI-compatible Chat Completions, and Responses.
 - Captures requests, responses, API-exposed thinking/reasoning, tool arguments, and results returned in subsequent model context.
-- Writes one append-only `sessions-rl.jsonl`. Link by actual response ID / previous_response_id; when IDs change without a link, group by CRC32 of system through first user, checking SHA-256 to separate CRC32 collisions. Request IDs are never used as response IDs.
+- Writes one append-only `session-<group-id>-rl.jsonl` per stable group. Link by actual response ID / previous_response_id; when IDs change without a link, group by CRC32 of system through first user, checking SHA-256 to separate CRC32 collisions. Request IDs are never used as response IDs.
 - Recovers OMP/MCP tool names, arguments, and results from request history, including after a proxy restart. Repeated context is marked; ambiguous origins are not guessed.
 - No personal models, upstream endpoints, API keys, or agent configuration are bundled.
 
@@ -196,27 +196,27 @@ Some provider shims advertise an OpenAI API while sending Anthropic requests. Au
 
 Launcher output defaults to `audit-logs/<run-id>/` beside the script. The Windows launcher defaults to the script directory's parent.
 
-- `sessions-rl.jsonl`: one append-only payload journal. Each exchange is a schema-v2 delta retaining request/response structures, parsed SSE, ChatML, separate `thinking`, and tool arguments/results.
+- `session-<group-id>-rl.jsonl`: one append-only payload journal per stable group. Each exchange is a schema-v2 delta retaining request/response structures, parsed SSE, ChatML, separate `thinking`, and tool arguments/results.
 - `audit.jsonl`: a small exchange index with status, duration, stream ID and THINK presence/character counts; no repeated conversation body.
 - `tools.jsonl`: a small tool index. Resolve `exchange_id` and `tool_trace_index` against the journal for full payloads; already-marked context replays do not repeat the index entry.
 
 The first exchange of each stream supplies its baseline. Later lines contain only `set/remove/append/splice` changes from `base_exchange_id`, with a `state_sha256` replay checksum. Existing journal bytes are never rewritten. THINK content remains explicit in ChatML; `thinking.present/characters` describe each captured assistant response without inventing missing reasoning.
 
-Response IDs identify responses, not necessarily conversations. Known current or previous response IDs link exchanges; otherwise CRC32 of the system and first user anchors the stream. SHA-256 disambiguates CRC32 collisions. Identical initial prompts are grouping hints, not strict independent-session or branch identities. All streams share one physical JSONL file.
+Response IDs identify responses, not necessarily conversations. Known current or previous response IDs link exchanges; otherwise CRC32 of the system and first user anchors the stream. SHA-256 disambiguates CRC32 collisions. Identical initial prompts are grouping hints, not strict independent-session or branch identities. Each group has its own named file, such as `session-crc32-1a2b3c4d-rl.jsonl`. Linked responses retain the original group file; without initial context the name contains the response ID. A fresh response ID alone does not force a new file.
 
-A file lock serializes threads/processes. Restart replays the journal and restores exchange-ID deduplication. Subsequent writes read only newly appended frames. Corrupt or incomplete tails are rejected without overwriting evidence. Interrupted streams retain captured payloads and interruption markers. A frame is committed at response end/interruption, not after each token. Memory holds the last state per stream and correlation indexes; startup replays the existing journal.
+A file lock serializes threads/processes. Restart replays the journal and restores exchange-ID deduplication. Subsequent writes read only newly appended frames, merging files by commit sequence; each file also replays independently. Corrupt or incomplete tails are rejected without overwriting evidence. Interrupted streams retain captured payloads and interruption markers. A frame is committed at response end/interruption, not after each token. Memory holds the last state per stream and correlation indexes; startup replays the existing journal.
 
 Read complete exchanges on demand without writing full snapshots back to disk:
 
 ```python
 from omp_audit_proxy import iter_session_records
 
-for exchange in iter_session_records("sessions-rl.jsonl"):
+for exchange in iter_session_records("/path/to/logs"):
     messages = exchange.get("chatml", {}).get("messages", [])
     # Separate assistant thinking and full tool_trace payloads are preserved.
 ```
 
-Legacy files are not automatically converted or deleted. A running old proxy does not hot-reload deployed code. Tool calls are not proof of success; results must be returned in client context before the proxy can capture them. Replay retains captured original exchange structures; ChatML remains a lossy derived view.
+Legacy `sessions-rl.jsonl` files are not converted or deleted; pass their file path explicitly to replay them. Directory replay reads only the new named journals in commit order. A running old proxy does not hot-reload deployed code and keeps its existing filename until normal restart. Tool calls are not proof of success; results must be returned in client context before the proxy can capture them. Replay retains captured original exchange structures; ChatML remains a lossy derived view.
 
 ```bash
 python -B -X utf8 test_audit_proxy.py

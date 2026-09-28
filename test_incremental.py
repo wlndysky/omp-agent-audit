@@ -37,10 +37,13 @@ def run_checks(directory_parent=None):
             {"role": "assistant", "content": "answer", "reasoning_content": "visible reasoning"},
             {"role": "user", "content": "next"}])
         writer.write(second)
-        checks.append(("journal_uses_one_jsonl_for_changing_response_ids", list(root.glob("*.jsonl")) == [path]
+        checks.append(("journal_keeps_one_named_file_per_group_when_response_ids_change", list(root.glob("*.jsonl")) == [path]
                        and not list(root.glob("session-*-rl.json"))))
         checks.append(("journal_appends_without_rewriting_previous_bytes", path.read_bytes().startswith(first_bytes)))
         frames = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        checks.append(("journal_filename_contains_the_crc32_group",
+                       path.name == "session-crc32-" + frames[0]["context_crc32"] + "-rl.jsonl"
+                       and not (root / "sessions-rl.jsonl").exists()))
         checks.append(("journal_groups_changing_ids_by_initial_context_crc32",
                        frames[0]["stream_id"] == frames[1]["stream_id"]
                        and frames[1]["stream_id"].startswith("crc32:")
@@ -74,7 +77,8 @@ def run_checks(directory_parent=None):
         checks.append(("journal_unkeyed_is_explicitly_unclassified", unknown["stream_id"] == "unclassified:f"))
         unsafe = fixture("g", "../../outside", "unique")
         restarted.write(unsafe)
-        checks.append(("journal_response_id_cannot_control_file_path", Path(restarted.path) == root / "sessions-rl.jsonl"))
+        checks.append(("journal_response_id_cannot_control_file_path", Path(restarted.path).parent == root
+                       and Path(restarted.path).name == ap.session_filename(unsafe["stream_id"])))
         same_id_other_provider = fixture("h", "resp_1", "separate provider prompt")
         same_id_other_provider["upstream"] = "https://different.example/v1"
         restarted.write(same_id_other_provider)
@@ -88,6 +92,9 @@ def run_checks(directory_parent=None):
         restarted.write(no_context_b)
         checks.append(("journal_no_context_response_ids_are_provider_scoped",
                        no_context_a["stream_id"] != no_context_b["stream_id"]))
+        checks.append(("journal_filename_retains_response_id_without_context",
+                       Path(restarted.path).name.startswith("session-reused-")
+                       and len(list(ap.iter_session_records(restarted.path))) == 1))
         conflict = root / "path-conflict"
         conflict.mkdir()
         result = subprocess.run([sys.executable, "-B", ap.__file__, "--proxy-only", "--port", "0",
@@ -105,7 +112,7 @@ def run_checks(directory_parent=None):
 
         damaged = root / "damaged"
         damaged.mkdir()
-        damaged_path = damaged / "sessions-rl.jsonl"
+        damaged_path = damaged / path.name
         damaged_path.write_bytes(first_bytes + b'{"unfinished":')
         original = damaged_path.read_bytes()
         refused = False
@@ -139,6 +146,25 @@ def run_checks(directory_parent=None):
         checks.append(("journal_partial_response_only_appends_new_thinking",
                        Path(growth.path).stat().st_size - tail_size < 3000
                        and list(ap.iter_session_records(growth.path))[-1] == updated))
+        interleaved_dir = root / "interleaved"
+        interleaved = ap.SessionJsonWriter(str(interleaved_dir))
+        interleaved_rows = []
+        for number, prompt in enumerate(("flow A", "flow B", "flow A", "flow B")):
+            item = fixture("interleaved-" + str(number), "flow-response-" + str(number), prompt)
+            interleaved.write(item)
+            interleaved_rows.append(item)
+        checks.append(("journal_independent_flows_have_independent_named_files",
+                       len(list(interleaved_dir.glob("session-*-rl.jsonl"))) == 2
+                       and list(ap.iter_session_records(interleaved_dir)) == interleaved_rows))
+        resumed = ap.SessionJsonWriter(str(interleaved_dir))
+        followup = fixture("interleaved-4", "flow-response-4", "fresh context")
+        followup["request"]["body"]["previous_response_id"] = "flow-response-0"
+        resumed.write(followup)
+        checks.append(("journal_restart_restores_links_across_multiple_files",
+                       followup["session_file"] == interleaved_rows[0]["session_file"]
+                       and list(ap.iter_session_records(interleaved_dir)) == interleaved_rows + [followup]
+                       and list(ap.iter_session_records(interleaved_dir / followup["session_file"])) ==
+                       [interleaved_rows[0], interleaved_rows[2], followup]))
         checks.append(("journal_index_has_no_request_or_tool_payload", "request" not in ap.audit_index(updated)
                        and "tool_trace" not in ap.audit_index(updated) and ap.audit_index(updated)["thinking"]["present"]))
 
@@ -152,7 +178,7 @@ def run_checks(directory_parent=None):
                      creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0) for i in range(3)]
         try:
             results = [process.communicate(timeout=30) for process in processes]
-            concurrent_rows = list(ap.iter_session_records(Path(concurrent) / "sessions-rl.jsonl"))
+            concurrent_rows = list(ap.iter_session_records(concurrent))
             checks.append(("journal_concurrent_processes_keep_every_exchange_once",
                            all(p.returncode == 0 for p in processes) and len(concurrent_rows) == 9
                            and len({r["exchange_id"] for r in concurrent_rows}) == 9))

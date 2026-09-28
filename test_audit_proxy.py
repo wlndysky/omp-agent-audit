@@ -295,7 +295,7 @@ def cli_smoke(mock_port, body):
                     if any(e.get("event") == "tool_result" for e in entries):
                         break
                 time.sleep(0.02)
-            reconstructed = list(ap.iter_session_records(os.path.join(directory, "sessions-rl.jsonl")))
+            reconstructed = list(ap.iter_session_records(directory))
             payloads = [event for record in reconstructed for event in record.get("tool_trace", [])]
             with open(path, encoding="utf-8") as fh:
                 audit_entries = [json.loads(line) for line in fh if line.strip()]
@@ -594,7 +594,7 @@ def real_omp_smoke(api="openai-completions"):
             with open(os.path.join(directory, "logs", "tools.jsonl"), encoding="utf-8") as fh:
                 events = [json.loads(line) for line in fh if line.strip()]
             tool_results = [e for e in events if e.get("event") == "tool_result"]
-            session_archives = list(ap.iter_session_records(os.path.join(directory, "logs", "sessions-rl.jsonl")))
+            session_archives = list(ap.iter_session_records(os.path.join(directory, "logs")))
             tool_results = [e for archive in session_archives for e in archive.get("tool_trace", [])
                             if e.get("event") == "tool_result"]
             before_failed_run = len(requests)
@@ -765,7 +765,7 @@ def main():
     with open(logpath, encoding="utf-8") as fh:
         lines = [json.loads(x) for x in fh if x.strip()]
     raw_log = open(logpath, encoding="utf-8").read()
-    session_documents = list(ap.iter_session_records(os.path.join(logdir, "sessions-rl.jsonl")))
+    session_documents = list(ap.iter_session_records(logdir))
     results.append(("incremental_journal_covers_all_recorded_exchanges",
                     {item["exchange_id"] for item in session_documents} ==
                     {item["exchange_id"] for item in lines if item.get("request")}))

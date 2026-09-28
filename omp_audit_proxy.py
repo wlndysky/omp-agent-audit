@@ -20,7 +20,7 @@ omp_audit_proxy.py — 本地（127.0.0.1-only）LLM API 流式审计反向代�
   - openai-completions:  POST {baseUrl}/chat/completions
   - openai-responses:    POST {baseUrl}/responses
 
-输出：sessions-rl.jsonl 只追加变化，重启后可校验重放，不重写累计 JSON。
+输出：session-<稳定分组ID>-rl.jsonl，每个响应链或 CRC32 组独立命名、只追加变化。
 audit.jsonl 和 tools.jsonl 默认仅为小型索引，正文只保存在增量日志中。
 工具结果包含工具名、参数、返回内容、调用/结果 exchange ID、来源与重复历史标记。
 直接运行本脚本可启动代理和 OMP，使用临时扩展，不修改原模型配置。
@@ -48,8 +48,10 @@ import argparse
 import base64
 import copy
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
+import glob
 import hashlib
+import heapq
 import hmac
 import http.client
 import json
@@ -354,33 +356,89 @@ def apply_json_delta(before, changes):
     return value
 
 
-def iter_session_records(path):
-    """Reconstruct exchanges one at a time; the journal itself stays incremental."""
-    states, heads = {}, {}
+def session_filename(stream_id):
+    """Stable, Windows-safe filename; response changes do not change a stream's name."""
+    value = stream_id.removeprefix("response:")
+    if value.startswith("crc32:") or value.startswith("unclassified:"):
+        value = value.replace(":", "-", 1)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", value)[:120]
+    if safe != value or not safe or value != value.lower():
+        safe = (safe or "id") + "-" + hashlib.sha256(stream_id.encode()).hexdigest()[:16]
+    return "session-" + safe + "-rl.jsonl"
+
+
+def _journal_frames(directory, offsets=None):
+    """Merge named journals in commit order, buffering at most one frame per file."""
+    offsets = offsets or {}
+    paths = set(glob.glob(os.path.join(directory, "session-*-rl.jsonl")))
+    if set(offsets) - paths:
+        raise ValueError("A journal was removed while the writer is running")
+    with ExitStack() as stack:
+        pending = []
+
+        def advance(path, handle):
+            line = handle.readline()
+            if not line:
+                return
+            if not line.endswith(b"\n"):
+                raise ValueError("Incomplete journal tail; refusing to overwrite evidence")
+            frame = json.loads(line)
+            if not isinstance(frame, dict) or not isinstance(frame.get("sequence"), int):
+                raise ValueError("Named journal is missing its commit sequence")
+            heapq.heappush(pending, (frame["sequence"], path, frame, len(line), handle))
+
+        for path in sorted(paths):
+            offset = offsets.get(path, 0)
+            size = os.path.getsize(path)
+            if size < offset:
+                raise ValueError("Journal truncated while writer is running")
+            if size == offset:
+                continue
+            handle = stack.enter_context(open(path, "rb"))
+            handle.seek(offset)
+            advance(path, handle)
+        while pending:
+            sequence, path, frame, length, handle = heapq.heappop(pending)
+            if os.path.basename(path) != session_filename(frame.get("stream_id", "")):
+                raise ValueError("Journal filename does not match its stream ID")
+            yield frame, path, length
+            advance(path, handle)
+
+
+def _single_journal_frames(path):
     with open(path, encoding="utf-8") as handle:
         for line in handle:
             if not line.endswith("\n"):
                 raise ValueError("Incomplete journal tail; refusing silent truncation")
-            frame = json.loads(line)
-            stream = frame["stream_id"]
-            if frame.get("schema_version") != 2 or frame.get("base_exchange_id") != heads.get(stream):
-                raise ValueError("Incompatible or broken journal chain")
-            state = apply_json_delta(states.get(stream, {}), frame["changes"])
-            if hashlib.sha256(_canon(state).encode()).hexdigest() != frame["state_sha256"]:
-                raise ValueError("Journal state checksum mismatch")
-            states[stream], heads[stream] = state, frame["exchange_id"]
-            yield copy.deepcopy(state)
+            yield json.loads(line)
+
+
+def iter_session_records(path):
+    """Reconstruct exchanges one at a time; the journal itself stays incremental."""
+    states, heads = {}, {}
+    frames = ((frame for frame, _, _ in _journal_frames(path)) if os.path.isdir(path)
+              else _single_journal_frames(path))
+    for frame in frames:
+        stream = frame["stream_id"]
+        if frame.get("schema_version") != 2 or frame.get("base_exchange_id") != heads.get(stream):
+            raise ValueError("Incompatible or broken journal chain")
+        state = apply_json_delta(states.get(stream, {}), frame["changes"])
+        if hashlib.sha256(_canon(state).encode()).hexdigest() != frame["state_sha256"]:
+            raise ValueError("Journal state checksum mismatch")
+        states[stream], heads[stream] = state, frame["exchange_id"]
+        yield copy.deepcopy(state)
 
 
 class SessionJsonWriter:
-    """One append-only journal, response-ID links with a CRC32 context fallback."""
+    """One named append-only journal per stable response chain or CRC32 group."""
 
     def __init__(self, directory: str):
         self.directory = os.path.abspath(directory)
-        self.path = os.path.join(self.directory, "sessions-rl.jsonl")
+        self.path = None
         self.lock = threading.Lock()
-        self.states, self.heads, self.responses, self.contexts, self.seen = {}, {}, {}, {}, set()
-        self.offset = 0
+        self.states, self.heads, self.responses, self.contexts, self.seen = {}, {}, {}, {}, {}
+        self.offsets = {}
+        self.sequence = 0
         self.frames = 0
         os.makedirs(self.directory, exist_ok=True)
 
@@ -388,11 +446,12 @@ class SessionJsonWriter:
         with self.lock:
             pass  # Every committed frame is already flushed and fsynced.
 
-    def _accept(self, frame, state):
+    def _accept(self, frame, state, path):
         stream = frame["stream_id"]
         self.states[stream] = state
         self.heads[stream] = frame["exchange_id"]
-        self.seen.add(frame["exchange_id"])
+        self.seen[frame["exchange_id"]] = path
+        self.sequence = frame["sequence"]
         if frame.get("response_id"):
             self.responses[(frame["scope"], frame["response_id"])] = stream
         if frame.get("context_sha256"):
@@ -400,27 +459,16 @@ class SessionJsonWriter:
         self.frames += 1
 
     def _sync(self):
-        if not os.path.exists(self.path):
-            if self.offset:
-                raise ValueError("Journal removed while writer is running")
-            return
-        if os.path.getsize(self.path) < self.offset:
-            raise ValueError("Journal truncated while writer is running")
-        with open(self.path, "rb") as handle:
-            handle.seek(self.offset)
-            for line in handle:
-                if not line.endswith(b"\n"):
-                    raise ValueError("Incomplete journal tail; refusing to overwrite evidence")
-                frame = json.loads(line)
-                stream = frame["stream_id"]
-                if (frame.get("schema_version") != 2
-                        or frame.get("base_exchange_id") != self.heads.get(stream)):
-                    raise ValueError("Incompatible or broken journal chain")
-                state = apply_json_delta(self.states.get(stream, {}), frame["changes"])
-                if hashlib.sha256(_canon(state).encode()).hexdigest() != frame["state_sha256"]:
-                    raise ValueError("Journal state checksum mismatch")
-                self._accept(frame, state)
-                self.offset += len(line)
+        for frame, path, length in _journal_frames(self.directory, self.offsets):
+            stream = frame["stream_id"]
+            if (frame.get("schema_version") != 2 or frame["sequence"] <= self.sequence
+                    or frame.get("base_exchange_id") != self.heads.get(stream)):
+                raise ValueError("Incompatible or broken journal chain")
+            state = apply_json_delta(self.states.get(stream, {}), frame["changes"])
+            if hashlib.sha256(_canon(state).encode()).hexdigest() != frame["state_sha256"]:
+                raise ValueError("Journal state checksum mismatch")
+            self._accept(frame, state, path)
+            self.offsets[path] = self.offsets.get(path, 0) + length
 
     def write(self, record):
         if not record.get("request") or not record.get("protocol"):
@@ -438,6 +486,7 @@ class SessionJsonWriter:
         with self.lock, _session_file_lock(lock_path):
             self._sync()
             if record["exchange_id"] in self.seen:
+                self.path = self.seen[record["exchange_id"]]
                 return self.path
             stream = self.responses.get((scope, response_id)) if response_id else None
             reason = "response_id" if stream else None
@@ -455,10 +504,12 @@ class SessionJsonWriter:
                 stream = ("response:" + response_id + "@" + hashlib.sha256(scope.encode()).hexdigest()[:12]
                           if response_id else "unclassified:" + record["exchange_id"])
                 reason = "response_id" if response_id else "unclassified"
-            record["session_file"] = "sessions-rl.jsonl"
+            record["session_file"] = session_filename(stream)
+            self.path = os.path.join(self.directory, record["session_file"])
             record["stream_id"] = stream
             state = copy.deepcopy(record)
             frame = {"schema_version": 2, "event": "exchange_delta", "stream_id": stream,
+                     "sequence": self.sequence + 1,
                      "grouped_by": reason, "scope": scope, "context_crc32": crc,
                      "context_sha256": fingerprint, "response_id": response_id,
                      "exchange_id": record["exchange_id"], "base_exchange_id": self.heads.get(stream),
@@ -474,8 +525,8 @@ class SessionJsonWriter:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            self.offset += len(payload)
-            self._accept(frame, state)
+            self.offsets[self.path] = self.offsets.get(self.path, 0) + len(payload)
+            self._accept(frame, state, self.path)
         return self.path
 
 
@@ -1643,7 +1694,7 @@ def main(argv=None) -> int:
     ap.add_argument("--log-max-bytes", type=int, default=64 * 1024 * 1024)
     ap.add_argument("--log-backups", type=int, default=5)
     ap.add_argument("--tools-log", help="独立工具轨迹 JSONL，默认与 --log 同目录下的 tools.jsonl")
-    ap.add_argument("--sessions-dir", help="追加式 sessions-rl.jsonl 目录，默认与 --log 同目录")
+    ap.add_argument("--sessions-dir", help="按稳定响应链或 CRC32 命名的 session-*-rl.jsonl 目录")
     ap.add_argument("--route", action="append", default=[],
                     help="上游路由 prefix=upstream 或 prefix=upstream=hint，可重复；仅代理模式至少配置一个")
     ap.add_argument("--upstream-connect-timeout", type=float, default=30.0)
@@ -1690,9 +1741,13 @@ def main(argv=None) -> int:
     if os.path.normcase(os.path.abspath(tools_path)) == os.path.normcase(os.path.abspath(args.log)):
         ap.error("--tools-log 不能与 --log 使用同一个文件")
     sessions_dir = args.sessions_dir or os.path.dirname(os.path.abspath(args.log))
-    journal_path = os.path.normcase(os.path.abspath(os.path.join(sessions_dir, "sessions-rl.jsonl")))
-    if journal_path in (os.path.normcase(os.path.abspath(args.log)), os.path.normcase(os.path.abspath(tools_path))):
-        ap.error("审计/工具索引不能与 sessions-rl.jsonl 增量正文使用同一个文件")
+    journal_directory = os.path.normcase(os.path.abspath(sessions_dir))
+    for index_path in (args.log, tools_path):
+        normalized = os.path.normcase(os.path.abspath(index_path))
+        name = os.path.basename(normalized)
+        if (os.path.dirname(normalized) == journal_directory and
+                (name == "sessions-rl.jsonl" or re.fullmatch(r"session-.*-rl[.]jsonl", name))):
+            ap.error("审计/工具索引不能使用保留的 session-*-rl.jsonl 正文文件名")
     handler = type("ConfiguredAuditHandler", (AuditHandler,), {})
     handler.routes = routes
     handler.logger = JsonlLogger(args.log, args.log_max_bytes, args.log_backups)
