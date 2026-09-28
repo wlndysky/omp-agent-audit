@@ -13,7 +13,7 @@ A local LLM API audit proxy for OMP built-in tools, MCP tools, and model context
 - 单文件 Python，纯标准库，仅监听 `127.0.0.1`。
 - 支持 Anthropic Messages、OpenAI-compatible Chat Completions 和 Responses 的 JSON / SSE 报文。
 - 记录请求、响应、API 返回的 thinking/reasoning、工具调用参数及后续上下文回传的结果。
-- 按 response ID 输出 `session-<id>-rl.json`，包含派生 ChatML 和工具轨迹；无 response ID 时使用 system → 首条 user 的 SHA-256 哈希分文件。请求 ID 只作为附加元数据。
+- 默认只写一个追加式 `sessions-rl.jsonl`：优先按真实 response ID / previous_response_id 关联，ID 每轮变化且无法关联时按 system → 首条 user 的 CRC32 分组；SHA-256 校验锚点，避免 CRC32 碰撞误合并。请求 ID 不冒充响应 ID。
 - 从请求历史恢复 OMP/MCP 工具名、参数和结果；重复历史会标记，无法确定的原始调用来源保留为空。
 - 不内置个人模型、上游地址、API Key 或 agent 配置。
 
@@ -72,34 +72,47 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 
 部分 provider 会登记为 OpenAI、实际通过适配层发送 Anthropic 请求。因此自动路由还会按每次请求的实际协议检查基础路径，而不只依赖模型目录中的 API 类型。日志的 `routing` 字段记录目录类型、实际协议及路径是否调整；手动路由不受此规则影响。
 
-### 日志与操作
+### 增量日志与操作
 
-一键启动默认输出到脚本旁的 `audit-logs/<本次运行ID>/`，各次运行隔离；仅代理模式默认使用 `audit-logs/`：
+一键启动默认输出到脚本旁的 `audit-logs/<本次运行ID>/`。Windows 启动脚本默认输出到脚本目录的上一级。
 
-- `audit.jsonl`：每次 HTTP 交换的请求/响应、解析后的 SSE 事件、ID 分类、ChatML 和工具轨迹。
-- `tools.jsonl`：每条工具事件单独一行，便于检索工具名、参数、结果和跨轮关联。
-- `session-<response-id>-rl.json`：按真实响应 ID 分类的独立 JSON；没有响应 ID 时命名为 `session-sha256-<hash>-rl.json`。默认与 `audit.jsonl` 同目录，也可用 `--sessions-dir` 指定。
+- `sessions-rl.jsonl`：唯一的正文日志，每次交换追加一行 `schema_version: 2` 增量。包含请求、解析后的响应/SSE、ChatML、独立 `thinking` 字段及工具参数/结果。
+- `audit.jsonl`：交换 ID、流 ID、状态、耗时和 THINK 字符数等小型索引，不重复保存完整上下文。
+- `tools.jsonl`：工具事件索引，通过 `exchange_id` 和 `tool_trace_index` 定位正文，不重复写大段工具结果；已标记的历史重播不再写索引。
 
-分类 JSON 的 `messages` 是最新一轮的派生 ChatML，`tool_trace` 汇总该文件中的工具轨迹，`exchanges` 保留各次请求/响应、API 可见的推理和证据。相同 ID/哈希的多轮追加到同一文件；重复导出同一 exchange 不会重复添加。文件使用锁和原子替换，已有文件损坏时拒绝覆盖并报告错误。文件名中不安全、过长或可能造成大小写冲突的 ID 会加哈希后缀，原始 ID 仍在 JSON 中保留。
+每个流首次保存基线，后续只追加相对上一条的 `set/remove/append/splice` 变化，不反复写全量对话，也不整体覆盖累计 JSON。保留原始结构，文件原有字节不改写；`state_sha256` 校验重建结果。每行有 `base_exchange_id`、`response_id` 和明确的 `thinking.present/characters`。无 THINK 的响应如实标为 false，不生成思考内容。
 
-`request-id`/`x-request-id` 不冒充 response ID。若响应 ID 和初始上下文都不可得，使用明确标记的 `session-unclassified-<exchange-id>-rl.json`。相同初始上下文的不同会话可能产生同一哈希，因此哈希只是分组线索，不是严格会话身份。
+真实 response ID 是响应关联键，不一定是会话 ID。Anthropic/Chat Completions 经常每轮换 ID，因此无法通过响应链关联时用初始上下文 CRC32 分流；所有流都在同一个 JSONL 中。相同 CRC32 但不同 SHA-256 锚点会分开；完全相同的初始上下文仍只是分组线索，不是独立运行或分支的严格身份。
 
-工具事件的 `event` 为 `tool_call`（当前响应中的调用）、`tool_call_context`（历史调用）或 `tool_result`（上下文回传的结果）。调用记录不等于执行成功。`replayed_context` 标记重复结果；`call_exchange_ambiguous` 表示原始交换来源有歧义。`tool_kind_hint` 仅按名称分类，不是身份认证；错误状态未报告时 `is_error` 为 `null`，不擅自判定成功。
+线程和进程共享文件锁。重启按日志重放恢复状态，并按 exchange ID 防止重复导出；后续只读其他写入者新增的尾部。损坏或未写完的末行拒绝覆盖。异常中断的响应保留已捕获内容和断连标记。日志写入发生在响应结束/中断时，不是每个 token 立刻落盘。启动时会重放现有日志，内存保留每个流最后的状态及关联索引。
 
-JSONL 总日志保持追加写入；独立分类 JSON 在每次响应结束后更新，异常断连时保留已捕获部分及相应标记。分类 JSON 不随总日志轮转删除，请自行安排存储清理；`.session-locks/` 仅保存写入锁文件。跨请求来源缓存有界且仅在内存中；代理重启后仍可从请求历史恢复工具内容，但不会虚构原始 exchange ID。
+需要读取完整交换时按需重放，不要重新落盘每轮全量快照：
+
+```python
+from omp_audit_proxy import iter_session_records
+
+for exchange in iter_session_records("sessions-rl.jsonl"):
+    messages = exchange.get("chatml", {}).get("messages", [])
+    # exchange["tool_trace"] contains arguments and results.
+    # Assistant messages keep API-visible reasoning in message["thinking"].
+```
+
+旧版文件不会自动转换或删除；旧程序不会热更新，部署后须正常重新启动。工具记录不等于执行成功；工具结果必须由客户端回传才可被代理记录。原始交换结构经重放保留，ChatML 仍是有损派生视图。
 
 ```bash
 python omp_audit_proxy.py --help
 python -B -X utf8 test_audit_proxy.py
+python -B -X utf8 test_audit_proxy.py --real-omp
 ```
 
-- `--port`：一键启动默认选择空闲端口，仅代理模式默认 `8787`。
-- 一键模式下按 OMP 自身方式退出，代理随后停止；`Ctrl+C` 保留 OMP 的取消当前轮次语义。仅代理模式用 `Ctrl+C` 停止。
-- `--log` / `--tools-log`：分别指定完整审计和工具轨迹文件。
-- `--log-max-bytes` / `--log-backups`：默认每个日志约 64 MiB 后轮转，保留 5 个备份；不是永久归档。
-- `--upstream-connect-timeout`：默认 30 秒；响应开始后取消该连接的 socket 读超时。
+- `--log` / `--tools-log`：两个索引的位置；`--sessions-dir`：增量正文的位置。
+- `--raw-log`：仅显式调试启用，额外保留全量审计及工具 JSONL，文件会明显增大。默认关闭。
+- 增量导出失败时，`audit.jsonl` 会带 `session_export_error` 保存该次完整记录作为恢复证据，不会静默丢弃正文。
+- `--log-max-bytes` / `--log-backups`：仅轮转两个索引，默认约 64 MiB、5 个备份；增量正文不轮转，以免丢失重建基线。
+- `--port`：一键模式自动选择空闲端口，仅代理模式默认 `8787`；`--upstream-connect-timeout` 默认 30 秒。
+- 正常按 OMP 自身方式退出，代理随后停止；一键模式的 `Ctrl+C` 保留 OMP 取消当前轮次的语义。
 
-默认测试使用本机临时端口和模拟上游，不需要 API Key，不调用真实模型或真实 MCP 服务。加 `--real-omp` 会额外启动已安装的真实 OMP，使用临时独立配置和本机假上游，验证一次真实 read 工具调用、配置未被重写，以及不安全路由在推理前停止。不代表已验证所有 provider、Vibe 子代理路径或用户的完整 agent 环境。
+测试全部使用本机合成数据。`--real-omp` 启动真实 OMP 但使用独立临时配置和本机模拟上游，验证 read 工具、路由、配置保留和默认增量输出，不调用付费模型或真实 MCP。工具索引只是检索入口；完整参数和回传结果在增量正文中。
 
 ### 隐私与限制
 
@@ -120,7 +133,7 @@ python -B -X utf8 test_audit_proxy.py
 - One Python file, standard library only, bound to `127.0.0.1`.
 - JSON and SSE handling for Anthropic Messages, OpenAI-compatible Chat Completions, and Responses.
 - Captures requests, responses, API-exposed thinking/reasoning, tool arguments, and results returned in subsequent model context.
-- Writes `session-<id>-rl.json` archives with derived ChatML and tool traces, grouped by response ID or a system-to-first-user SHA-256 hash when absent. Request IDs remain additional metadata.
+- Writes one append-only `sessions-rl.jsonl`. Link by actual response ID / previous_response_id; when IDs change without a link, group by CRC32 of system through first user, checking SHA-256 to separate CRC32 collisions. Request IDs are never used as response IDs.
 - Recovers OMP/MCP tool names, arguments, and results from request history, including after a proxy restart. Repeated context is marked; ambiguous origins are not guessed.
 - No personal models, upstream endpoints, API keys, or agent configuration are bundled.
 
@@ -179,34 +192,44 @@ One-command launches mirror OMP's Anthropic URL normalization: remove a trailing
 
 Some provider shims advertise an OpenAI API while sending Anthropic requests. Automatic routes therefore check each request's wire protocol, not only the model catalog hint. The `routing` log field records the catalog API, wire API, and whether the base path changed. Explicit manual routes remain untouched.
 
-### Logs and operation
+### Incremental logs and operation
 
-One-command launches write to `audit-logs/<run-id>/` beside the script, isolating each run. Proxy-only mode defaults to `audit-logs/`:
+Launcher output defaults to `audit-logs/<run-id>/` beside the script. The Windows launcher defaults to the script directory's parent.
 
-- `audit.jsonl`: HTTP exchanges, parsed SSE events, ID classification, derived ChatML, and tool traces.
-- `tools.jsonl`: one tool event per line, including names, arguments, results, and correlation fields.
-- `session-<response-id>-rl.json`: a separate JSON archive for each response ID, or `session-sha256-<hash>-rl.json` when it is absent. Files default to the same directory as `audit.jsonl`; override with `--sessions-dir`.
+- `sessions-rl.jsonl`: one append-only payload journal. Each exchange is a schema-v2 delta retaining request/response structures, parsed SSE, ChatML, separate `thinking`, and tool arguments/results.
+- `audit.jsonl`: a small exchange index with status, duration, stream ID and THINK presence/character counts; no repeated conversation body.
+- `tools.jsonl`: a small tool index. Resolve `exchange_id` and `tool_trace_index` against the journal for full payloads; already-marked context replays do not repeat the index entry.
 
-Each archive exposes the latest derived ChatML in `messages`, aggregated tool events in `tool_trace`, and captured requests/responses, API-visible reasoning, and evidence in `exchanges`. Repeated IDs/hashes accumulate exchanges rather than overwrite them; re-exporting the same exchange is idempotent. File locks and atomic replacement protect writes, and corrupt existing files are not overwritten. Unsafe, overlong, or case-sensitive IDs receive a hash suffix in the filename; their original values remain in the JSON.
+The first exchange of each stream supplies its baseline. Later lines contain only `set/remove/append/splice` changes from `base_exchange_id`, with a `state_sha256` replay checksum. Existing journal bytes are never rewritten. THINK content remains explicit in ChatML; `thinking.present/characters` describe each captured assistant response without inventing missing reasoning.
 
-Request IDs are metadata, not substitutes for response IDs. When neither a response ID nor the initial context is available, files are explicitly named `session-unclassified-<exchange-id>-rl.json`. Identical initial contexts can share a hash across distinct conversations; hashes are grouping hints, not authenticated session identities.
+Response IDs identify responses, not necessarily conversations. Known current or previous response IDs link exchanges; otherwise CRC32 of the system and first user anchors the stream. SHA-256 disambiguates CRC32 collisions. Identical initial prompts are grouping hints, not strict independent-session or branch identities. All streams share one physical JSONL file.
 
-Event types are `tool_call` (current response), `tool_call_context` (historical call), and `tool_result` (result echoed in context). An observed call is not proof of successful execution. `replayed_context` marks repeated results; `call_exchange_ambiguous` flags uncertain origins. `tool_kind_hint` is name-based, not an authenticated identity. An unreported error status is `null`, not assumed success.
+A file lock serializes threads/processes. Restart replays the journal and restores exchange-ID deduplication. Subsequent writes read only newly appended frames. Corrupt or incomplete tails are rejected without overwriting evidence. Interrupted streams retain captured payloads and interruption markers. A frame is committed at response end/interruption, not after each token. Memory holds the last state per stream and correlation indexes; startup replays the existing journal.
 
-JSONL indexes are append-only; separate session JSON files update after each response, retaining captured data and markers on interrupted streams. Session archives are not deleted by JSONL rotation, so manage their storage separately. The `.session-locks/` directory only holds writer locks. The cross-request cache is bounded and in-memory; after restart, context can recover tool contents but not missing original exchange IDs.
+Read complete exchanges on demand without writing full snapshots back to disk:
 
-```bash
-python omp_audit_proxy.py --help
-python -B -X utf8 test_audit_proxy.py
+```python
+from omp_audit_proxy import iter_session_records
+
+for exchange in iter_session_records("sessions-rl.jsonl"):
+    messages = exchange.get("chatml", {}).get("messages", [])
+    # Separate assistant thinking and full tool_trace payloads are preserved.
 ```
 
-- `--port` selects a free port in launcher mode and defaults to `8787` in proxy-only mode.
-- Exit OMP normally to stop its proxy. In launcher mode, `Ctrl+C` retains OMP's cancel-turn behavior; in proxy-only mode it stops the proxy.
-- `--log` and `--tools-log` select the two output files.
-- `--log-max-bytes` and `--log-backups` default to rotation after approximately 64 MiB per file and five backups. Logs are not permanent archives.
-- `--upstream-connect-timeout` defaults to 30 seconds; the socket read timeout is removed once the response starts.
+Legacy files are not automatically converted or deleted. A running old proxy does not hot-reload deployed code. Tool calls are not proof of success; results must be returned in client context before the proxy can capture them. Replay retains captured original exchange structures; ChatML remains a lossy derived view.
 
-Default tests use temporary loopback ports and a mock upstream, with no API key or real model/MCP server calls. Add `--real-omp` to exercise the installed OMP against an isolated temporary configuration and a local fake provider: it performs a real read tool call, checks that model configuration is unchanged, and verifies unsafe routing stops before inference. Passing does not certify every provider, Vibe subagent path, or a user's full deployment.
+```bash
+python -B -X utf8 test_audit_proxy.py
+python -B -X utf8 test_audit_proxy.py --real-omp
+```
+
+- `--log` / `--tools-log` locate the small indexes; `--sessions-dir` locates the incremental payload journal.
+- `--raw-log` explicitly enables additional full audit/tool dumps for debugging. Off by default.
+- On journal export failure, the audit index retains the failed full record with `session_export_error` as recovery evidence.
+- `--log-max-bytes` / `--log-backups` rotate only indexes (64 MiB / 5 backups by default). The journal is not rotated: later changes depend on earlier baselines.
+- `--port`: automatically selected in launcher mode, `8787` in proxy-only mode; upstream connect timeout defaults to 30 seconds.
+
+Tests use local synthetic fixtures. `--real-omp` additionally drives installed OMP against loopback mock upstreams with temporary isolated configuration, checking read tools, routing, unchanged configuration and incremental output. No paid models or real MCP services are invoked. Tool indexes are pointers; payloads remain in the journal.
 
 ### Privacy and limitations
 

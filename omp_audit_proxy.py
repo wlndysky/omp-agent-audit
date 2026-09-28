@@ -3,11 +3,11 @@
 omp_audit_proxy.py — 本地（127.0.0.1-only）LLM API 流式审计反向代理，单文件，纯标准库。
 
 用途：作为 OMP（或任何 OpenAI/Anthropic 兼容客户端）与真实上游之间的透明中转，
-把每次请求/响应（含 SSE 流）以 JSONL 落盘，并按 response/request ID 分类；
-无 ID 时对 system+首条 user 消息做 sha256 作为流标识。
+把每次请求/响应（含解析后的 SSE）以增量 JSONL 落盘；优先关联真实 response ID，
+无法关联时用 system+首条 user 的 CRC32 分组，SHA-256 防止 CRC32 碰撞误合并。
 
 它能看到什么（边界声明）：
-  - 经过本代理的 HTTP 请求体原文、响应头、SSE 事件流原文。
+  - 经过本代理的 HTTP 请求体、响应头、解析后的 SSE 事件。
   - 模型通过 API 暴露的 thinking/reasoning 增量、文本增量、tool_use/tool_calls 结构，
     以及下一次请求体中回传的 tool_result（Anthropic）/ role:"tool" 消息（OpenAI）。
 它看不到什么：
@@ -20,8 +20,8 @@ omp_audit_proxy.py — 本地（127.0.0.1-only）LLM API 流式审计反向代�
   - openai-completions:  POST {baseUrl}/chat/completions
   - openai-responses:    POST {baseUrl}/responses
 
-输出：session-<response-id>-rl.json 按响应 ID 保存独立 JSON；缺 ID 时使用初始上下文哈希。
-audit.jsonl 保留总记录；tools.jsonl 单独保存 OMP 内置/MCP 工具轨迹。
+输出：sessions-rl.jsonl 只追加变化，重启后可校验重放，不重写累计 JSON。
+audit.jsonl 和 tools.jsonl 默认仅为小型索引，正文只保存在增量日志中。
 工具结果包含工具名、参数、返回内容、调用/结果 exchange ID、来源与重复历史标记。
 直接运行本脚本可启动代理和 OMP，使用临时扩展，不修改原模型配置。
 路由可用 --route /local/=https://upstream.example/v1=openai-completions 自定义。
@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 from collections import OrderedDict
 from contextlib import contextmanager
 import hashlib
@@ -67,6 +68,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # --------------------------------------------------------------------------
@@ -241,7 +243,7 @@ class JsonlLogger:
 
 
 # --------------------------------------------------------------------------
-# Per-response JSON archives, independent of the rotating JSONL index.
+# Append-only incremental journal, independent of the rotating JSONL indexes.
 # --------------------------------------------------------------------------
 
 
@@ -258,16 +260,6 @@ def classify_ids(ids: list[dict], fallback: str | None) -> dict:
     return {"ids": candidates, "primary_id": primary["id"] if primary else None,
             "primary_source": primary.get("source") if primary else None,
             "confidence": primary.get("confidence", "high") if primary else "none"}
-
-
-def session_filename(stream_id: str) -> str:
-    value = stream_id.removeprefix("sha256:") if stream_id.startswith("sha256:") else stream_id
-    if stream_id.startswith("sha256:"):
-        value = "sha256-" + value
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", value)[:120]
-    if safe != value or not safe or value != value.lower():
-        safe = (safe or "id") + "-" + hashlib.sha256(stream_id.encode()).hexdigest()[:16]
-    return "session-" + safe + "-rl.json"
 
 
 @contextmanager
@@ -300,65 +292,208 @@ def _session_file_lock(path: str):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _json_delta(before, after, path=()):
+    """Lossless JSON changes; unchanged history never appears in an append."""
+    if _canon(before) == _canon(after):
+        return []
+    if isinstance(before, dict) and isinstance(after, dict):
+        changes = [{"op": "remove", "path": [*path, key]} for key in before if key not in after]
+        for key, value in after.items():
+            if key in before:
+                changes.extend(_json_delta(before[key], value, (*path, key)))
+            else:
+                changes.append({"op": "set", "path": [*path, key], "value": value})
+        return changes
+    if isinstance(before, list) and isinstance(after, list):
+        prefix = 0
+        while prefix < min(len(before), len(after)) and _canon(before[prefix]) == _canon(after[prefix]):
+            prefix += 1
+        suffix = 0
+        while (suffix < min(len(before), len(after)) - prefix
+               and _canon(before[len(before)-suffix-1]) == _canon(after[len(after)-suffix-1])):
+            suffix += 1
+        old_end, new_end = len(before)-suffix, len(after)-suffix
+        splice = [{"op": "splice", "path": list(path), "index": prefix,
+                   "delete": old_end-prefix, "values": after[prefix:new_end]}]
+        nested = []
+        for index in range(prefix, min(old_end, new_end)):
+            nested.extend(_json_delta(before[index], after[index], (*path, index)))
+        if old_end != new_end:
+            start = min(old_end, new_end)
+            nested.append({"op": "splice", "path": list(path), "index": start,
+                           "delete": max(0, old_end-new_end), "values": after[start:new_end]})
+        return nested if len(_canon(nested)) < len(_canon(splice)) else splice
+    if isinstance(before, str) and isinstance(after, str) and before and after.startswith(before):
+        return [{"op": "append", "path": list(path), "value": after[len(before):]}]
+    return [{"op": "set", "path": list(path), "value": after}]
+
+
+def apply_json_delta(before, changes):
+    """Replay a journal frame without modifying its previous state."""
+    value = copy.deepcopy(before)
+    for change in changes:
+        path = change["path"]
+        if not path:
+            raise ValueError("Root snapshot replacement is not an incremental frame")
+        parent = value
+        for part in path[:-1]:
+            parent = parent[part]
+        key = path[-1]
+        operation = change["op"]
+        if operation == "set":
+            parent[key] = copy.deepcopy(change["value"])
+        elif operation == "remove":
+            del parent[key]
+        elif operation == "append":
+            parent[key] += change["value"]
+        elif operation == "splice":
+            start = change["index"]
+            parent[key][start:start+change["delete"]] = copy.deepcopy(change["values"])
+        else:
+            raise ValueError("Unknown journal operation: " + str(operation))
+    return value
+
+
+def iter_session_records(path):
+    """Reconstruct exchanges one at a time; the journal itself stays incremental."""
+    states, heads = {}, {}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.endswith("\n"):
+                raise ValueError("Incomplete journal tail; refusing silent truncation")
+            frame = json.loads(line)
+            stream = frame["stream_id"]
+            if frame.get("schema_version") != 2 or frame.get("base_exchange_id") != heads.get(stream):
+                raise ValueError("Incompatible or broken journal chain")
+            state = apply_json_delta(states.get(stream, {}), frame["changes"])
+            if hashlib.sha256(_canon(state).encode()).hexdigest() != frame["state_sha256"]:
+                raise ValueError("Journal state checksum mismatch")
+            states[stream], heads[stream] = state, frame["exchange_id"]
+            yield copy.deepcopy(state)
+
+
 class SessionJsonWriter:
-    """One complete JSON file per response ID, otherwise per initial-context hash."""
+    """One append-only journal, response-ID links with a CRC32 context fallback."""
 
     def __init__(self, directory: str):
         self.directory = os.path.abspath(directory)
+        self.path = os.path.join(self.directory, "sessions-rl.jsonl")
         self.lock = threading.Lock()
+        self.states, self.heads, self.responses, self.contexts, self.seen = {}, {}, {}, {}, set()
+        self.offset = 0
+        self.frames = 0
         os.makedirs(self.directory, exist_ok=True)
 
-    def flush(self) -> None:
-        # Let an in-progress atomic write finish before a normal process exit.
+    def flush(self):
         with self.lock:
-            pass
+            pass  # Every committed frame is already flushed and fsynced.
 
-    def write(self, record: dict) -> str | None:
+    def _accept(self, frame, state):
+        stream = frame["stream_id"]
+        self.states[stream] = state
+        self.heads[stream] = frame["exchange_id"]
+        self.seen.add(frame["exchange_id"])
+        if frame.get("response_id"):
+            self.responses[(frame["scope"], frame["response_id"])] = stream
+        if frame.get("context_sha256"):
+            self.contexts[(frame["context_crc32"], frame["context_sha256"])] = stream
+        self.frames += 1
+
+    def _sync(self):
+        if not os.path.exists(self.path):
+            if self.offset:
+                raise ValueError("Journal removed while writer is running")
+            return
+        if os.path.getsize(self.path) < self.offset:
+            raise ValueError("Journal truncated while writer is running")
+        with open(self.path, "rb") as handle:
+            handle.seek(self.offset)
+            for line in handle:
+                if not line.endswith(b"\n"):
+                    raise ValueError("Incomplete journal tail; refusing to overwrite evidence")
+                frame = json.loads(line)
+                stream = frame["stream_id"]
+                if (frame.get("schema_version") != 2
+                        or frame.get("base_exchange_id") != self.heads.get(stream)):
+                    raise ValueError("Incompatible or broken journal chain")
+                state = apply_json_delta(self.states.get(stream, {}), frame["changes"])
+                if hashlib.sha256(_canon(state).encode()).hexdigest() != frame["state_sha256"]:
+                    raise ValueError("Journal state checksum mismatch")
+                self._accept(frame, state)
+                self.offset += len(line)
+
+    def write(self, record):
         if not record.get("request") or not record.get("protocol"):
-            return None  # Health checks and unrelated requests are not sessions.
-        request = record["request"]
-        fallback = fallback_stream_id(record["protocol"], request.get("body"))
-        if not fallback and str(record.get("conversation_hint", "")).startswith("sha256:"):
-            fallback = record["conversation_hint"]
-        grouping = classify_ids((record.get("classification") or {}).get("ids", []), fallback)
-        stream_id = grouping["primary_id"] or "unclassified-" + record["exchange_id"]
-        record["classification"] = grouping
-        name = session_filename(stream_id)
-        record["session_file"] = name
-        path = os.path.join(self.directory, name)
-        lock_path = os.path.join(self.directory, ".session-locks", name + ".lock")
+            return None
+        body = record["request"].get("body")
+        anchor = initial_context(record["protocol"], body)
+        encoded = _canon(anchor).encode("utf-8") if anchor is not None else None
+        crc = f"{zlib.crc32(encoded):08x}" if encoded is not None else None
+        fingerprint = hashlib.sha256(encoded).hexdigest() if encoded is not None else None
+        grouping = classify_ids((record.get("classification") or {}).get("ids", []), None)
+        response_id = grouping["primary_id"]
+        previous_id = body.get("previous_response_id") if isinstance(body, dict) else None
+        scope = str(record.get("upstream", "")) + "|" + record["protocol"]
+        lock_path = os.path.join(self.directory, ".session-locks", "sessions-rl.lock")
         with self.lock, _session_file_lock(lock_path):
-            archive = {"schema_version": 1, "stream_id": stream_id, "classification": grouping,
-                       "chatml_derived": True, "chatml_lossy": True, "messages": [],
-                       "tool_trace": [], "exchanges": []}
-            if os.path.exists(path):
-                with open(path, encoding="utf-8") as fh:
-                    archive = json.load(fh)
-                if (not isinstance(archive, dict) or archive.get("stream_id") != stream_id
-                        or not isinstance(archive.get("exchanges"), list)):
-                    raise ValueError("Refusing to overwrite an incompatible session archive")
-            if any(item.get("exchange_id") == record["exchange_id"] for item in archive["exchanges"]):
-                return path  # Re-exporting an existing exchange is idempotent.
-            archive["exchanges"].append(record)
-            archive["exchanges"].sort(key=lambda item: (item.get("ts_epoch", 0), item["exchange_id"]))
-            latest = archive["exchanges"][-1]
-            archive["messages"] = (latest.get("chatml") or {}).get("messages", [])
-            archive["tool_trace"] = [event for item in archive["exchanges"] for event in item.get("tool_trace", [])]
-            archive["exchange_count"] = len(archive["exchanges"])
-            temporary = None
-            try:
-                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=".session-write-",
-                                                 suffix=".tmp", dir=self.directory, delete=False) as fh:
-                    temporary = fh.name
-                    json.dump(archive, fh, ensure_ascii=False, indent=2, default=str)
-                    fh.write("\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(temporary, path)
-            finally:
-                if temporary and os.path.exists(temporary):
-                    os.unlink(temporary)
-        return path
+            self._sync()
+            if record["exchange_id"] in self.seen:
+                return self.path
+            stream = self.responses.get((scope, response_id)) if response_id else None
+            reason = "response_id" if stream else None
+            if not stream and previous_id:
+                stream = self.responses.get((scope, previous_id))
+                if stream:
+                    reason = "previous_response_id"
+            if not stream and crc:
+                stream = self.contexts.get((crc, fingerprint))
+                if not stream:
+                    collision = any(key[0] == crc and key[1] != fingerprint for key in self.contexts)
+                    stream = "crc32:" + crc + ("-" + fingerprint[:16] if collision else "")
+                reason = "system+first_user.crc32"
+            if not stream:
+                stream = ("response:" + response_id + "@" + hashlib.sha256(scope.encode()).hexdigest()[:12]
+                          if response_id else "unclassified:" + record["exchange_id"])
+                reason = "response_id" if response_id else "unclassified"
+            record["session_file"] = "sessions-rl.jsonl"
+            record["stream_id"] = stream
+            state = copy.deepcopy(record)
+            frame = {"schema_version": 2, "event": "exchange_delta", "stream_id": stream,
+                     "grouped_by": reason, "scope": scope, "context_crc32": crc,
+                     "context_sha256": fingerprint, "response_id": response_id,
+                     "exchange_id": record["exchange_id"], "base_exchange_id": self.heads.get(stream),
+                     "thinking": thinking_summary(state),
+                     "changes": _json_delta(self.states.get(stream, {}), state),
+                     "state_sha256": hashlib.sha256(_canon(state).encode()).hexdigest()}
+            payload = (_canon(frame) + "\n").encode("utf-8")
+            with open(self.path, "ab") as handle:
+                try:
+                    os.chmod(self.path, 0o600)
+                except OSError:
+                    pass
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.offset += len(payload)
+            self._accept(frame, state)
+        return self.path
+
+
+def thinking_summary(record):
+    messages = (record.get("chatml") or {}).get("messages", [])
+    assistant = messages[-1] if messages and messages[-1].get("role") == "assistant" else {}
+    text = assistant.get("thinking") or ""
+    return {"present": bool(text), "characters": len(text), "field": "chatml.messages[-1].thinking"}
+
+
+def audit_index(record):
+    """No prompt, tool result, or response payloads duplicated in the index."""
+    names = ("ts", "ts_epoch", "exchange_id", "protocol", "stream_id", "session_file", "duration_ms",
+             "error", "health", "client_disconnect", "response_truncated_by", "session_export_error")
+    return {**{key: record[key] for key in names if key in record},
+            "status": (record.get("response") or {}).get("status"),
+            "response_id": classify_ids((record.get("classification") or {}).get("ids", []), None)["primary_id"],
+            "thinking": thinking_summary(record)}
 
 
 # --------------------------------------------------------------------------
@@ -398,8 +533,8 @@ def _canon(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def fallback_stream_id(protocol: str, body) -> str | None:
-    """无上游 ID 时：system + 首条 user 消息的稳定 hash。支持 anthropic 与 openai 两种请求形。"""
+def initial_context(protocol: str, body):
+    """Keep the exact system and first-user anchor, excluding later history."""
     if not isinstance(body, dict):
         return None
     system = None
@@ -429,7 +564,15 @@ def fallback_stream_id(protocol: str, body) -> str | None:
         system = sys_parts if sys_parts else None
     if system is None and first_user is None:
         return None
-    digest = hashlib.sha256(_canon({"system": system, "first_user": first_user}).encode("utf-8")).hexdigest()
+    return {"system": system, "first_user": first_user}
+
+
+def fallback_stream_id(protocol: str, body) -> str | None:
+    # Retained for backwards-compatible tool correlation; journal grouping uses CRC32.
+    anchor = initial_context(protocol, body)
+    if anchor is None:
+        return None
+    digest = hashlib.sha256(_canon(anchor).encode("utf-8")).hexdigest()
     return f"sha256:{digest[:24]}"
 
 
@@ -471,6 +614,12 @@ def derive_chatml_request(protocol: str, body) -> list[dict]:
             entry = {"role": m.get("role"), "content": _text_of(m.get("content"))}
             # 保留工具结构（不单压成文本）
             if isinstance(m.get("content"), list):
+                thinking = "".join(c.get("thinking", "") for c in m["content"]
+                                   if isinstance(c, dict) and c.get("type") == "thinking")
+                if thinking:
+                    entry["thinking"] = thinking
+                    entry["content"] = _text_of([c for c in m["content"]
+                                                  if not isinstance(c, dict) or c.get("type") != "thinking"])
                 tu = [c for c in m["content"] if isinstance(c, dict) and c.get("type") == "tool_use"]
                 tr = [c for c in m["content"] if isinstance(c, dict) and c.get("type") == "tool_result"]
                 if tu:
@@ -503,6 +652,8 @@ def derive_chatml_request(protocol: str, body) -> list[dict]:
                 msgs.append({"role": "tool", "tool_call_id": m.get("call_id"), "content": m.get("output")})
                 continue
             entry = {"role": m.get("role"), "content": _text_of(m.get("content"))}
+            if m.get("reasoning_content") or m.get("reasoning") or m.get("thinking"):
+                entry["thinking"] = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
             if m.get("tool_calls"):
                 entry["tool_calls"] = m["tool_calls"]
             if m.get("role") == "tool":
@@ -978,6 +1129,7 @@ class AuditHandler(BaseHTTPRequestHandler):
     logger: JsonlLogger | None = None
     tool_logger: JsonlLogger | None = None
     session_writer: SessionJsonWriter | None = None
+    raw_log = False
     control_token: str | None = None
     route_lock = threading.Lock()
     upstream_connect_timeout = 30.0
@@ -1048,14 +1200,24 @@ class AuditHandler(BaseHTTPRequestHandler):
             if self.session_writer:
                 try:
                     self.session_writer.write(record)
-                except (OSError, ValueError, TypeError) as exc:
+                except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
                     record["session_export_error"] = type(exc).__name__
-                    print(f"[audit] session JSON export failed: {exc}", file=sys.stderr)
+                    print(f"[audit] incremental journal export failed: {exc}", file=sys.stderr)
             if self.logger:
-                self.logger.write(record)
+                # Preserve a failed export as explicit recovery evidence, never silently lose it.
+                self.logger.write(record if self.raw_log or record.get("session_export_error") else audit_index(record))
             if self.tool_logger:
                 grouping = record.get("classification") or {}
-                for event in record.get("tool_trace", []):
+                for index, event in enumerate(record.get("tool_trace", [])):
+                    if not self.raw_log:
+                        if event.get("replayed_context"):
+                            continue
+                        self.tool_logger.write({"ts": record["ts"], "exchange_id": record["exchange_id"],
+                                                "stream_id": record.get("stream_id"),
+                                                "session_file": record.get("session_file"), "tool_trace_index": index,
+                                                "event": event.get("event"), "tool_name": event.get("tool_name"),
+                                                "tool_call_id": event.get("tool_call_id")})
+                        continue
                     self.tool_logger.write({"ts": record["ts"], "exchange_id": record["exchange_id"],
                                             "route": record.get("route"), "protocol": record.get("protocol"),
                                             "classification_id": grouping.get("primary_id"),
@@ -1477,10 +1639,11 @@ def main(argv=None) -> int:
     ap.add_argument("--host", default="127.0.0.1", help="绑定地址（默认 127.0.0.1；不要改成 0.0.0.0）")
     ap.add_argument("--port", type=int, help="代理模式默认 8787；一键启动默认自动选择空闲端口")
     ap.add_argument("--log", help="审计 JSONL；一键启动默认按次分目录")
+    ap.add_argument("--raw-log", action="store_true", help="显式调试：额外保存全量原始审计和工具日志（占用大）")
     ap.add_argument("--log-max-bytes", type=int, default=64 * 1024 * 1024)
     ap.add_argument("--log-backups", type=int, default=5)
     ap.add_argument("--tools-log", help="独立工具轨迹 JSONL，默认与 --log 同目录下的 tools.jsonl")
-    ap.add_argument("--sessions-dir", help="分类 JSON 文件目录，默认与 --log 同目录")
+    ap.add_argument("--sessions-dir", help="追加式 sessions-rl.jsonl 目录，默认与 --log 同目录")
     ap.add_argument("--route", action="append", default=[],
                     help="上游路由 prefix=upstream 或 prefix=upstream=hint，可重复；仅代理模式至少配置一个")
     ap.add_argument("--upstream-connect-timeout", type=float, default=30.0)
@@ -1526,13 +1689,18 @@ def main(argv=None) -> int:
     tools_path = args.tools_log or os.path.join(os.path.dirname(os.path.abspath(args.log)), "tools.jsonl")
     if os.path.normcase(os.path.abspath(tools_path)) == os.path.normcase(os.path.abspath(args.log)):
         ap.error("--tools-log 不能与 --log 使用同一个文件")
+    sessions_dir = args.sessions_dir or os.path.dirname(os.path.abspath(args.log))
+    journal_path = os.path.normcase(os.path.abspath(os.path.join(sessions_dir, "sessions-rl.jsonl")))
+    if journal_path in (os.path.normcase(os.path.abspath(args.log)), os.path.normcase(os.path.abspath(tools_path))):
+        ap.error("审计/工具索引不能与 sessions-rl.jsonl 增量正文使用同一个文件")
     handler = type("ConfiguredAuditHandler", (AuditHandler,), {})
     handler.routes = routes
     handler.logger = JsonlLogger(args.log, args.log_max_bytes, args.log_backups)
     handler.tool_logger = JsonlLogger(tools_path, args.log_max_bytes, args.log_backups)
-    handler.session_writer = SessionJsonWriter(args.sessions_dir or os.path.dirname(os.path.abspath(args.log)))
+    handler.session_writer = SessionJsonWriter(sessions_dir)
     handler.upstream_connect_timeout = args.upstream_connect_timeout
     handler.verbose = args.verbose
+    handler.raw_log = args.raw_log
     handler.control_token = secrets.token_urlsafe(32) if launch else None
 
     port = args.port if args.port is not None else (0 if launch else 8787)

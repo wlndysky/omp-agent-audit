@@ -295,11 +295,18 @@ def cli_smoke(mock_port, body):
                     if any(e.get("event") == "tool_result" for e in entries):
                         break
                 time.sleep(0.02)
+            reconstructed = list(ap.iter_session_records(os.path.join(directory, "sessions-rl.jsonl")))
+            payloads = [event for record in reconstructed for event in record.get("tool_trace", [])]
+            with open(path, encoding="utf-8") as fh:
+                audit_entries = [json.loads(line) for line in fh if line.strip()]
             return [
                 ("cli_starts_and_healthcheck_passes", healthy),
                 ("cli_custom_route_forwards_unchanged", status == 200 and data == NOID_SSE.encode()),
                 ("cli_writes_mcp_tool_trace", any(e.get("tool_name") == "mcp__audit_echo"
-                  and e.get("content") == "pong" and e.get("arguments") == {"text": "pong"} for e in entries)),
+                  and e.get("content") == "pong" and e.get("arguments") == {"text": "pong"} for e in payloads)),
+                ("cli_default_indexes_do_not_repeat_model_or_tool_payloads",
+                 all("request" not in e and "chatml" not in e for e in audit_entries)
+                 and all("content" not in e and "arguments" not in e for e in entries)),
             ]
         finally:
             process.terminate()
@@ -427,89 +434,8 @@ def shim_route_regressions():
 
 
 def session_archive_regressions(directory_parent=None):
-    checks = []
-    def record(exchange, response_id=None, first_user="first prompt"):
-        body = {"messages": [{"role": "system", "content": "fixture system"},
-                              {"role": "user", "content": first_user}]}
-        ids = [{"id": "request-only", "source": "header:x-request-id", "confidence": "high"}]
-        if response_id:
-            ids.append({"id": response_id, "source": "body:json.id", "confidence": "high"})
-        return {"exchange_id": exchange, "protocol": "openai-completions",
-                "request": {"body": body}, "classification": {"ids": ids},
-                "chatml": {"messages": [*body["messages"],
-                           {"role": "assistant", "content": "fixture answer", "thinking": "visible reasoning"}]},
-                "tool_trace": [{"event": "tool_call", "tool_name": "read", "arguments": {"path": "fixture"}}]}
-    with tempfile.TemporaryDirectory(prefix="omp-audit-sessions-", dir=directory_parent) as directory:
-        writer = ap.SessionJsonWriter(directory)
-        first = record("a", "resp_fixture")
-        response_path = writer.write(first)
-        with open(response_path, encoding="utf-8") as fh:
-            response_archive = json.load(fh)
-        checks.append(("session_filename_uses_response_id", os.path.basename(response_path) == "session-resp_fixture-rl.json"))
-        checks.append(("session_json_keeps_chatml_thinking_tools_and_raw_exchange",
-                       response_archive["messages"][-1]["thinking"] == "visible reasoning"
-                       and response_archive["tool_trace"][0]["tool_name"] == "read"
-                       and response_archive["exchanges"][0]["request"] == first["request"]))
-        noid = record("b")
-        fallback = ap.fallback_stream_id(noid["protocol"], noid["request"]["body"])
-        hash_path = writer.write(noid)
-        checks.append(("session_without_response_uses_context_hash_not_request_id",
-                       os.path.basename(hash_path) == "session-sha256-" + fallback.split(":", 1)[1] + "-rl.json"
-                       and noid["classification"]["primary_id"] == fallback))
-        later = record("c")
-        later["request"]["body"]["messages"].extend([
-            {"role": "system", "content": "later context"}, {"role": "user", "content": "later prompt"}])
-        later_path = ap.SessionJsonWriter(directory).write(later)
-        writer.write(later)
-        with open(hash_path, encoding="utf-8") as fh:
-            grouped = json.load(fh)
-        checks.append(("session_hash_stays_stable_after_first_user", later_path == hash_path))
-        checks.append(("session_reexport_is_idempotent_and_restart_keeps_rounds", grouped["exchange_count"] == 2))
-        distinct = writer.write(record("d", first_user="different first prompt"))
-        checks.append(("session_distinct_first_user_gets_distinct_file", distinct != hash_path))
-        unsafe_path = writer.write(record("e", "../../outside:fixture"))
-        checks.append(("session_filename_cannot_escape_output_directory",
-                       os.path.dirname(unsafe_path) == directory and os.path.basename(unsafe_path).startswith("session-")))
-        unsupported = record("f")
-        unsupported["request"]["body"] = {}
-        unknown_path = writer.write(unsupported)
-        checks.append(("session_missing_initial_context_is_explicitly_unclassified",
-                       os.path.basename(unknown_path) == "session-unclassified-f-rl.json"))
-        response_header = ap.classify_ids([
-            {"id": "req_fixture", "source": "header:request-id", "confidence": "high"},
-            {"id": "resp_header_fixture", "source": "header:x-response-id", "confidence": "high"}], fallback)
-        checks.append(("session_accepts_explicit_response_id_header", response_header["primary_id"] == "resp_header_fixture"))
-        with open(response_path, "w", encoding="utf-8") as fh:
-            fh.write("invalid existing archive")
-        refused = False
-        try:
-            writer.write(record("g", "resp_fixture"))
-        except ValueError:
-            refused = True
-        with open(response_path, encoding="utf-8") as fh:
-            checks.append(("session_does_not_overwrite_corrupted_existing_archive",
-                           refused and fh.read() == "invalid existing archive"))
-        concurrent_dir = os.path.join(directory, "concurrent")
-        worker = ("import json, sys; from omp_audit_proxy import SessionJsonWriter; "
-                  "w=SessionJsonWriter(sys.argv[1]); r=json.loads(sys.argv[2]); "
-                  "[(r.update(exchange_id=sys.argv[3]+'-'+str(i)), w.write(r)) for i in range(3)]")
-        processes = [subprocess.Popen([sys.executable, "-B", "-X", "utf8", "-c", worker, concurrent_dir,
-                     json.dumps(record("concurrent")), str(i)], cwd=os.path.dirname(os.path.abspath(ap.__file__)),
-                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0) for i in range(3)]
-        try:
-            for process in processes:
-                process.communicate(timeout=20)
-            with open(os.path.join(concurrent_dir, ap.session_filename(fallback)), encoding="utf-8") as fh:
-                concurrent = json.load(fh)
-            checks.append(("session_concurrent_processes_keep_all_exchanges",
-                           all(p.returncode == 0 for p in processes) and concurrent["exchange_count"] == 9))
-        finally:
-            for process in processes:
-                if process.poll() is None:
-                    process.kill()
-                    process.communicate()
-    return checks
+    from test_incremental import run_checks
+    return run_checks(directory_parent)
 
 
 def windows_launcher_regressions():
@@ -668,12 +594,9 @@ def real_omp_smoke(api="openai-completions"):
             with open(os.path.join(directory, "logs", "tools.jsonl"), encoding="utf-8") as fh:
                 events = [json.loads(line) for line in fh if line.strip()]
             tool_results = [e for e in events if e.get("event") == "tool_result"]
-            expected_files = ["session-" + ("msg" if is_anthropic else "chatcmpl") +
-                              "-fixture-" + str(i) + "-rl.json" for i in (1, 2)]
-            session_archives = []
-            for filename in expected_files:
-                with open(os.path.join(directory, "logs", filename), encoding="utf-8") as fh:
-                    session_archives.append(json.load(fh))
+            session_archives = list(ap.iter_session_records(os.path.join(directory, "logs", "sessions-rl.jsonl")))
+            tool_results = [e for archive in session_archives for e in archive.get("tool_trace", [])
+                            if e.get("event") == "tool_result"]
             before_failed_run = len(requests)
             configuration["providers"]["audit-fixture"]["models"].append({
                 "id": "other", "baseUrl": f"http://127.0.0.1:{mock.server_port}/different/v1"})
@@ -688,7 +611,7 @@ def real_omp_smoke(api="openai-completions"):
                 ("real_omp_read_tool_audited", any(e.get("tool_name") == "read"
                   and "AUDIT_READ_OK" in str(e.get("content")) and e.get("correlated") for e in tool_results)),
                 ("real_omp_two_model_rounds_forwarded", len(requests) >= 2),
-                ("real_omp_exports_response_named_json_with_tool_result", len(session_archives) == 2
+                ("real_omp_exports_incremental_journal_with_tool_result", len(session_archives) == 2
                  and any(event.get("event") == "tool_result" and "AUDIT_READ_OK" in str(event.get("content"))
                          for archive in session_archives for event in archive["tool_trace"])),
                 ("real_omp_exact_upstream_paths", len(request_paths) == 2
@@ -722,6 +645,7 @@ def main():
         ap.Route("/up-responses/", f"http://127.0.0.1:{mock_port}/up-responses", "openai-responses"),
     ]
     ap.AuditHandler.routes = routes
+    ap.AuditHandler.raw_log = True  # Explicit raw mode preserves protocol-fixture assertions.
     ap.AuditHandler.logger = ap.JsonlLogger(logpath, max_bytes=10 * 1024 * 1024, backups=2)
     ap.AuditHandler.tool_logger = ap.JsonlLogger(toolpath)
     ap.AuditHandler.session_writer = ap.SessionJsonWriter(logdir)
@@ -841,16 +765,11 @@ def main():
     with open(logpath, encoding="utf-8") as fh:
         lines = [json.loads(x) for x in fh if x.strip()]
     raw_log = open(logpath, encoding="utf-8").read()
-    session_paths = [os.path.join(logdir, name) for name in os.listdir(logdir)
-                     if name.startswith("session-") and name.endswith("-rl.json")]
-    session_documents = []
-    for session_path in session_paths:
-        with open(session_path, encoding="utf-8") as fh:
-            session_documents.append(json.load(fh))
-    results.append(("session_archives_cover_all_recorded_exchanges",
-                    {item["exchange_id"] for doc in session_documents for item in doc["exchanges"]} ==
+    session_documents = list(ap.iter_session_records(os.path.join(logdir, "sessions-rl.jsonl")))
+    results.append(("incremental_journal_covers_all_recorded_exchanges",
+                    {item["exchange_id"] for item in session_documents} ==
                     {item["exchange_id"] for item in lines if item.get("request")}))
-    results.append(("session_archives_do_not_reintroduce_redacted_headers",
+    results.append(("incremental_journal_does_not_reintroduce_redacted_headers",
                     all(secret not in json.dumps(session_documents)
                         for secret in (SECRET_HEADER, SECRET_APIKEY, SECRET_COOKIE, SECRET_QUERY))))
 
