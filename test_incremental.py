@@ -28,7 +28,7 @@ def run_checks(directory_parent=None):
     checks = []
     with tempfile.TemporaryDirectory(prefix="omp-incremental-", dir=directory_parent) as temp:
         root = Path(temp)
-        writer = ap.SessionJsonWriter(str(root))
+        writer = ap.DeltaJournalWriter(str(root))
         first = fixture("a")
         path = Path(writer.write(first))
         first_bytes = path.read_bytes()
@@ -54,7 +54,7 @@ def run_checks(directory_parent=None):
         checks.append(("journal_has_explicit_think_presence", frames[0]["thinking"]["present"]
                        and frames[0]["thinking"]["characters"] == len("visible reasoning")))
         before = path.read_bytes()
-        restarted = ap.SessionJsonWriter(temp)
+        restarted = ap.DeltaJournalWriter(temp)
         restarted.write(copy.deepcopy(second))
         checks.append(("journal_restart_reexport_is_idempotent", path.read_bytes() == before))
         no_id = fixture("c", None)
@@ -103,7 +103,7 @@ def run_checks(directory_parent=None):
         checks.append(("journal_rejects_index_path_alias_before_writing", result.returncode == 2
                        and not list(conflict.iterdir())))
 
-        collisions = ap.SessionJsonWriter(str(root / "collision"))
+        collisions = ap.DeltaJournalWriter(str(root / "collision"))
         with patch.object(ap.zlib, "crc32", return_value=123):
             c1, c2 = fixture("c1", None, "one"), fixture("c2", None, "two")
             collisions.write(c1)
@@ -117,12 +117,12 @@ def run_checks(directory_parent=None):
         original = damaged_path.read_bytes()
         refused = False
         try:
-            ap.SessionJsonWriter(str(damaged)).write(fixture("bad"))
+            ap.DeltaJournalWriter(str(damaged)).write(fixture("bad"))
         except ValueError:
             refused = True
         checks.append(("journal_refuses_incomplete_tail_without_overwrite", refused and damaged_path.read_bytes() == original))
 
-        growth = ap.SessionJsonWriter(str(root / "growth"))
+        growth = ap.DeltaJournalWriter(str(root / "growth"))
         history = [{"role": "system", "content": "SYSTEM_SENTINEL_" + "S" * 50000},
                    {"role": "user", "content": "USER_SENTINEL_" + "U" * 50000}]
         expected, full_bytes = [], 0
@@ -147,7 +147,7 @@ def run_checks(directory_parent=None):
                        Path(growth.path).stat().st_size - tail_size < 3000
                        and list(ap.iter_session_records(growth.path))[-1] == updated))
         interleaved_dir = root / "interleaved"
-        interleaved = ap.SessionJsonWriter(str(interleaved_dir))
+        interleaved = ap.DeltaJournalWriter(str(interleaved_dir))
         interleaved_rows = []
         for number, prompt in enumerate(("flow A", "flow B", "flow A", "flow B")):
             item = fixture("interleaved-" + str(number), "flow-response-" + str(number), prompt)
@@ -156,7 +156,7 @@ def run_checks(directory_parent=None):
         checks.append(("journal_independent_flows_have_independent_named_files",
                        len(list(interleaved_dir.glob("session-*-rl.jsonl"))) == 2
                        and list(ap.iter_session_records(interleaved_dir)) == interleaved_rows))
-        resumed = ap.SessionJsonWriter(str(interleaved_dir))
+        resumed = ap.DeltaJournalWriter(str(interleaved_dir))
         followup = fixture("interleaved-4", "flow-response-4", "fresh context")
         followup["request"]["body"]["previous_response_id"] = "flow-response-0"
         resumed.write(followup)
@@ -169,8 +169,8 @@ def run_checks(directory_parent=None):
                        and "tool_trace" not in ap.audit_index(updated) and ap.audit_index(updated)["thinking"]["present"]))
 
         concurrent = str(root / "concurrent")
-        worker = ("import json,sys; from omp_audit_proxy import SessionJsonWriter; "
-                  "w=SessionJsonWriter(sys.argv[1]); r=json.loads(sys.argv[2]); "
+        worker = ("import json,sys; from omp_audit_proxy import DeltaJournalWriter; "
+                  "w=DeltaJournalWriter(sys.argv[1]); r=json.loads(sys.argv[2]); "
                   "[(r.update(exchange_id=sys.argv[3]+'-'+str(i)), w.write(r)) for i in range(3)]")
         processes = [subprocess.Popen([sys.executable, "-B", "-X", "utf8", "-c", worker, concurrent,
                      json.dumps(fixture("worker", None)), str(i)], cwd=os.path.dirname(ap.__file__),

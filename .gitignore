@@ -37,3 +37,8 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Internal evidence and readable JSON write staging.
+.audit-state/
+session-*-rl.json.tmp
+failed-*.json

@@ -3,7 +3,7 @@
 omp_audit_proxy.py — 本地（127.0.0.1-only）LLM API 流式审计反向代理，单文件，纯标准库。
 
 用途：作为 OMP（或任何 OpenAI/Anthropic 兼容客户端）与真实上游之间的透明中转，
-把每次请求/响应（含解析后的 SSE）以增量 JSONL 落盘；优先关联真实 response ID，
+把新对话、完整 thinking、工具参数/结果增量追加到可直接读取的 JSON；优先关联真实 response ID，
 无法关联时用 system+首条 user 的 CRC32 分组，SHA-256 防止 CRC32 碰撞误合并。
 
 它能看到什么（边界声明）：
@@ -20,8 +20,8 @@ omp_audit_proxy.py — 本地（127.0.0.1-only）LLM API 流式审计反向代�
   - openai-completions:  POST {baseUrl}/chat/completions
   - openai-responses:    POST {baseUrl}/responses
 
-输出：session-<稳定分组ID>-rl.jsonl，每个响应链或 CRC32 组独立命名、只追加变化。
-audit.jsonl 和 tools.jsonl 默认仅为小型索引，正文只保存在增量日志中。
+输出：session-<稳定分组ID>-rl.json，每个响应链或 CRC32 组独立命名、只追加新轮次。
+.audit-state 保存内部增量恢复证据；audit.jsonl 和 tools.jsonl 索引默认不生成。
 工具结果包含工具名、参数、返回内容、调用/结果 exchange ID、来源与重复历史标记。
 直接运行本脚本可启动代理和 OMP，使用临时扩展，不修改原模型配置。
 路由可用 --route /local/=https://upstream.example/v1=openai-completions 自定义。
@@ -415,6 +415,8 @@ def _single_journal_frames(path):
 
 def iter_session_records(path):
     """Reconstruct exchanges one at a time; the journal itself stays incremental."""
+    if os.path.isdir(path) and os.path.isdir(os.path.join(path, ".audit-state")):
+        path = os.path.join(path, ".audit-state")
     states, heads = {}, {}
     frames = ((frame for frame, _, _ in _journal_frames(path)) if os.path.isdir(path)
               else _single_journal_frames(path))
@@ -429,7 +431,7 @@ def iter_session_records(path):
         yield copy.deepcopy(state)
 
 
-class SessionJsonWriter:
+class DeltaJournalWriter:
     """One named append-only journal per stable response chain or CRC32 group."""
 
     def __init__(self, directory: str):
@@ -528,6 +530,191 @@ class SessionJsonWriter:
             self.offsets[self.path] = self.offsets.get(self.path, 0) + len(payload)
             self._accept(frame, state, self.path)
         return self.path
+
+
+def _message_view(message):
+    """Readable ChatML content, without transport-specific marker strings."""
+    result = {key: copy.deepcopy(message[key]) for key in
+              ("role", "content", "thinking", "tool_calls", "tool_results", "tool_call_id") if key in message}
+    if result.get("tool_calls"):
+        calls = []
+        for call in result["tool_calls"]:
+            function = call.get("function") or call
+            calls.append({"id": call.get("id"), "name": function.get("name"),
+                          "arguments": _arguments(function.get("arguments"))})
+        result["tool_calls"] = calls
+        content = result.get("content")
+        if isinstance(content, str):
+            for call in calls:
+                content = content.replace(f"[tool_use {call.get('name', '')}({call.get('id', '')})]", "")
+            result["content"] = content or None
+    return result
+
+
+def _tool_identity(event):
+    return _canon({key: event.get(key) for key in
+                   ("tool_call_id", "tool_name", "arguments", "content", "is_error")})
+
+
+class SessionJsonWriter:
+    """Human-readable JSON, adding new turns by replacing only the closing footer."""
+
+    FOOTER = b"\n  ]\n}\n"
+
+    def __init__(self, directory):
+        self.directory = os.path.abspath(directory)
+        self.journal = DeltaJournalWriter(os.path.join(self.directory, ".audit-state"))
+        self.lock = threading.Lock()
+        self.offsets, self.raw_states, self.heads = {}, {}, {}
+        self.documents, self.messages_seen, self.calls_seen, self.results_seen = {}, {}, {}, {}
+        self.dirty = set()
+        self.path = None
+
+    @staticmethod
+    def filename(stream):
+        return session_filename(stream)[:-1]  # .json, not .jsonl
+
+    def _make_turn(self, record, frame):
+        stream = frame["stream_id"]
+        message_keys = self.messages_seen.setdefault(stream, set())
+        call_keys = self.calls_seen.setdefault(stream, set())
+        result_keys = self.results_seen.setdefault(stream, set())
+        request_messages = derive_chatml_request(record["protocol"], record["request"].get("body"))
+        new_inputs, recovered = [], []
+        for index, message in enumerate(request_messages):
+            message = _message_view(message)
+            key = (index, _canon(message))
+            if key in message_keys:
+                continue
+            message_keys.add(key)
+            item = {"context_index": index, **message}
+            (new_inputs if message.get("role") in ("system", "developer", "user") else recovered).append(item)
+        all_messages = (record.get("chatml") or {}).get("messages", [])
+        assistant = (_message_view(all_messages[-1]) if len(all_messages) > len(request_messages)
+                     and all_messages[-1].get("role") == "assistant" else {})
+        if assistant:
+            message_keys.add((len(request_messages), _canon(assistant)))
+        calls, results = [], []
+        for event in record.get("tool_trace", []):
+            if event.get("event") in ("tool_call", "tool_call_context"):
+                key = _tool_identity(event)
+                if key not in call_keys:
+                    call_keys.add(key)
+                    calls.append(copy.deepcopy(event))
+            elif event.get("event") == "tool_result":
+                key = _tool_identity(event)
+                if key not in result_keys:
+                    result_keys.add(key)
+                    results.append(copy.deepcopy(event))
+        # Some imported records have assistant tool calls but no derived tool_trace.
+        for call in assistant.get("tool_calls", []):
+            event = {"event": "tool_call", "tool_call_id": call.get("id"), "tool_name": call.get("name"),
+                     "arguments": call.get("arguments"), "source": "assistant"}
+            key = _tool_identity(event)
+            if key not in call_keys:
+                call_keys.add(key)
+                calls.append(event)
+        response = record.get("response") or {}
+        turn = {"sequence": frame["sequence"], "exchange_id": record["exchange_id"],
+                "response_id": frame.get("response_id"), "timestamp": record.get("ts"),
+                "protocol": record.get("protocol"), "http_status": response.get("status"),
+                "input_messages": new_inputs, "recovered_messages": recovered,
+                "thinking": assistant.get("thinking"), "content": assistant.get("content"),
+                "tool_calls": calls, "tool_results": results}
+        source_assistant = all_messages[-1] if assistant else {}
+        if source_assistant.get("stop_reason"):
+            turn["stop_reason"] = source_assistant["stop_reason"]
+        if response.get("usage"):
+            turn["usage"] = response["usage"]
+        for key in ("duration_ms", "error", "client_disconnect", "response_truncated_by"):
+            if key in record:
+                turn[key] = record[key]
+        return turn
+
+    def _write_document(self, stream):
+        document = self.documents[stream]
+        path = os.path.join(self.directory, self.filename(stream))
+        existing = None
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    existing = json.load(handle)
+            except json.JSONDecodeError:
+                pass  # The durable internal journal can repair an interrupted footer append.
+        if existing is not None:
+            if (existing.get("schema_version") != 3 or existing.get("stream_id") != stream
+                    or not isinstance(existing.get("turns"), list)):
+                raise ValueError("Refusing to replace an incompatible readable JSON")
+            count = len(existing["turns"])
+            if existing["turns"] != document["turns"][:count]:
+                raise ValueError("Readable JSON disagrees with durable evidence; refusing overwrite")
+            additions = document["turns"][count:]
+            if not additions:
+                return
+            rendered = ["\n".join("    " + line for line in json.dumps(turn, ensure_ascii=False, indent=2).splitlines())
+                        for turn in additions]
+            payload = ((",\n" if count else "") + ",\n".join(rendered)).encode("utf-8") + self.FOOTER
+            with open(path, "r+b") as handle:
+                handle.seek(-len(self.FOOTER), os.SEEK_END)
+                if handle.read() != self.FOOTER:
+                    raise ValueError("Readable JSON has an unexpected footer")
+                handle.seek(-len(self.FOOTER), os.SEEK_END)
+                handle.write(payload)
+                handle.truncate()
+                handle.flush()
+                os.fsync(handle.fileno())
+            return
+        # Initial creation or crash recovery, never the normal per-response write path.
+        metadata = {key: value for key, value in document.items() if key != "turns"}
+        header = json.dumps(metadata, ensure_ascii=False, indent=2)[:-2] + ',\n  "turns": [\n'
+        turns = ["\n".join("    " + line for line in json.dumps(turn, ensure_ascii=False, indent=2).splitlines())
+                 for turn in document["turns"]]
+        temporary = path + ".tmp"
+        with open(temporary, "wb") as handle:
+            try:
+                os.chmod(temporary, 0o600)
+            except OSError:
+                pass
+            handle.write(header.encode("utf-8") + ",\n".join(turns).encode("utf-8") + self.FOOTER)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+
+    def _sync(self):
+        with _session_file_lock(os.path.join(self.journal.directory, ".session-locks", "sessions-rl.lock")):
+            for frame, path, length in _journal_frames(self.journal.directory, self.offsets):
+                stream = frame["stream_id"]
+                if frame.get("base_exchange_id") != self.heads.get(stream):
+                    raise ValueError("Broken internal evidence chain")
+                state = apply_json_delta(self.raw_states.get(stream, {}), frame["changes"])
+                if hashlib.sha256(_canon(state).encode()).hexdigest() != frame["state_sha256"]:
+                    raise ValueError("Internal evidence checksum mismatch")
+                document = self.documents.setdefault(stream, {"schema_version": 3, "stream_id": stream,
+                    "grouped_by": frame["grouped_by"], "context_crc32": frame.get("context_crc32"),
+                    "description": "New conversation content only; thinking and tool payloads are directly readable.",
+                    "turns": []})
+                document["turns"].append(self._make_turn(state, frame))
+                self.raw_states[stream], self.heads[stream] = state, frame["exchange_id"]
+                self.offsets[path] = self.offsets.get(path, 0) + length
+                self.dirty.add(stream)
+        for stream in list(self.dirty):
+            self._write_document(stream)
+            self.dirty.remove(stream)
+
+    def write(self, record):
+        if not record.get("request") or not record.get("protocol"):
+            return None
+        with self.lock, _session_file_lock(os.path.join(self.journal.directory, "readable-json.lock")):
+            internal = self.journal.write(record)
+            self._sync()
+            name = os.path.basename(internal)[:-1]
+            self.path = os.path.join(self.directory, name)
+            record["session_file"] = name
+            return self.path
+
+    def flush(self):
+        with self.lock, _session_file_lock(os.path.join(self.journal.directory, "readable-json.lock")):
+            self._sync()
 
 
 def thinking_summary(record):
@@ -1186,7 +1373,7 @@ class AuditHandler(BaseHTTPRequestHandler):
     upstream_connect_timeout = 30.0
     verbose = False
 
-    def log_message(self, fmt, *args):  # 静音默认访问日志（JSONL 才是审计面）
+    def log_message(self, fmt, *args):  # 静音默认访问日志；审计写入结构化文件。
         if self.verbose:
             super().log_message(fmt, *args)
 
@@ -1254,6 +1441,14 @@ class AuditHandler(BaseHTTPRequestHandler):
                 except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
                     record["session_export_error"] = type(exc).__name__
                     print(f"[audit] incremental journal export failed: {exc}", file=sys.stderr)
+                    if not self.logger:
+                        try:
+                            recovery = os.path.join(self.session_writer.directory,
+                                                    "failed-" + record["exchange_id"] + ".json")
+                            with open(recovery, "w", encoding="utf-8") as handle:
+                                json.dump(record, handle, ensure_ascii=False, indent=2)
+                        except OSError as recovery_error:
+                            print(f"[audit] recovery JSON write failed: {recovery_error}", file=sys.stderr)
             if self.logger:
                 # Preserve a failed export as explicit recovery evidence, never silently lose it.
                 self.logger.write(record if self.raw_log or record.get("session_export_error") else audit_index(record))
@@ -1689,12 +1884,14 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="OMP 本地模型审计代理（127.0.0.1 only）")
     ap.add_argument("--host", default="127.0.0.1", help="绑定地址（默认 127.0.0.1；不要改成 0.0.0.0）")
     ap.add_argument("--port", type=int, help="代理模式默认 8787；一键启动默认自动选择空闲端口")
-    ap.add_argument("--log", help="审计 JSONL；一键启动默认按次分目录")
+    ap.add_argument("--log", help="可选审计索引路径（--indexes 启用）；未指定输出目录时沿用该文件的父目录")
+    ap.add_argument("--indexes", action="store_true", help="可选：额外生成 audit.jsonl / tools.jsonl 小型索引")
     ap.add_argument("--raw-log", action="store_true", help="显式调试：额外保存全量原始审计和工具日志（占用大）")
     ap.add_argument("--log-max-bytes", type=int, default=64 * 1024 * 1024)
     ap.add_argument("--log-backups", type=int, default=5)
-    ap.add_argument("--tools-log", help="独立工具轨迹 JSONL，默认与 --log 同目录下的 tools.jsonl")
-    ap.add_argument("--sessions-dir", help="按稳定响应链或 CRC32 命名的 session-*-rl.jsonl 目录")
+    ap.add_argument("--tools-log", help="可选工具索引路径（--indexes 启用），默认与 --log 同目录下的 tools.jsonl")
+    ap.add_argument("--sessions-dir", "--output-dir", dest="sessions_dir",
+                    help="可读 JSON 输出目录，文件按稳定响应链或 CRC32 命名为 session-*-rl.json")
     ap.add_argument("--route", action="append", default=[],
                     help="上游路由 prefix=upstream 或 prefix=upstream=hint，可重复；仅代理模式至少配置一个")
     ap.add_argument("--upstream-connect-timeout", type=float, default=30.0)
@@ -1733,8 +1930,8 @@ def main(argv=None) -> int:
         ap.error("请使用 --route /api/=https://upstream.example/v1=openai-completions 配置自己的上游")
 
     if args.log is None:
-        folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit-logs")
-        if launch:
+        folder = args.sessions_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit-logs")
+        if launch and not args.sessions_dir:
             folder = os.path.join(folder, time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:8])
         args.log = os.path.join(folder, "audit.jsonl")
     tools_path = args.tools_log or os.path.join(os.path.dirname(os.path.abspath(args.log)), "tools.jsonl")
@@ -1746,12 +1943,12 @@ def main(argv=None) -> int:
         normalized = os.path.normcase(os.path.abspath(index_path))
         name = os.path.basename(normalized)
         if (os.path.dirname(normalized) == journal_directory and
-                (name == "sessions-rl.jsonl" or re.fullmatch(r"session-.*-rl[.]jsonl", name))):
-            ap.error("审计/工具索引不能使用保留的 session-*-rl.jsonl 正文文件名")
+                (name == "sessions-rl.jsonl" or re.fullmatch(r"session-.*-rl[.]jsonl?", name))):
+            ap.error("审计/工具索引不能使用保留的 session-*-rl.json 正文文件名")
     handler = type("ConfiguredAuditHandler", (AuditHandler,), {})
     handler.routes = routes
-    handler.logger = JsonlLogger(args.log, args.log_max_bytes, args.log_backups)
-    handler.tool_logger = JsonlLogger(tools_path, args.log_max_bytes, args.log_backups)
+    handler.logger = JsonlLogger(args.log, args.log_max_bytes, args.log_backups) if args.indexes or args.raw_log else None
+    handler.tool_logger = JsonlLogger(tools_path, args.log_max_bytes, args.log_backups) if args.indexes or args.raw_log else None
     handler.session_writer = SessionJsonWriter(sessions_dir)
     handler.upstream_connect_timeout = args.upstream_connect_timeout
     handler.verbose = args.verbose
@@ -1762,13 +1959,16 @@ def main(argv=None) -> int:
     try:
         server = AuditHTTPServer((args.host, port), handler)
     except OSError:
-        handler.logger.close()
-        handler.tool_logger.close()
+        if handler.logger:
+            handler.logger.close()
+        if handler.tool_logger:
+            handler.tool_logger.close()
         raise
     server.daemon_threads = True
     print(f"[audit] listening on http://{args.host}:{server.server_address[1]}", file=sys.stderr)
-    print(f"[audit] log: {args.log}", file=sys.stderr)
-    print(f"[audit] tools: {tools_path}", file=sys.stderr)
+    if handler.logger:
+        print(f"[audit] log: {args.log}", file=sys.stderr)
+        print(f"[audit] tools: {tools_path}", file=sys.stderr)
     print(f"[audit] sessions: {handler.session_writer.directory}", file=sys.stderr)
     for r in routes:
         print(f"[audit] route {r.prefix} -> {r.upstream} ({r.hint})", file=sys.stderr)
@@ -1781,8 +1981,10 @@ def main(argv=None) -> int:
     finally:
         server.server_close()
         handler.session_writer.flush()
-        handler.logger.close()
-        handler.tool_logger.close()
+        if handler.logger:
+            handler.logger.close()
+        if handler.tool_logger:
+            handler.tool_logger.close()
     return 0
 
 

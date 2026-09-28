@@ -285,28 +285,26 @@ def cli_smoke(mock_port, body):
             healthy = response.status == 200 and json.loads(response.read()) == {"ok": True}
             connection.close()
             status, data = post(port, "/mock/chat/completions", body)
-            tools_path = os.path.join(directory, "tools.jsonl")
             deadline = time.monotonic() + 5
-            entries = []
+            documents = []
             while time.monotonic() < deadline:
-                if os.path.exists(tools_path):
-                    with open(tools_path, encoding="utf-8") as fh:
-                        entries = [json.loads(line) for line in fh if line.endswith("\n")]
-                    if any(e.get("event") == "tool_result" for e in entries):
-                        break
+                try:
+                    documents = [json.load(open(os.path.join(directory, name), encoding="utf-8"))
+                                 for name in os.listdir(directory) if name.startswith("session-") and name.endswith("-rl.json")]
+                except (ValueError, OSError):
+                    documents = []
+                if any(t.get("tool_results") for d in documents for t in d["turns"]):
+                    break
                 time.sleep(0.02)
-            reconstructed = list(ap.iter_session_records(directory))
-            payloads = [event for record in reconstructed for event in record.get("tool_trace", [])]
-            with open(path, encoding="utf-8") as fh:
-                audit_entries = [json.loads(line) for line in fh if line.strip()]
+            payloads = [e for d in documents for t in d["turns"] for e in t["tool_results"]]
             return [
                 ("cli_starts_and_healthcheck_passes", healthy),
                 ("cli_custom_route_forwards_unchanged", status == 200 and data == NOID_SSE.encode()),
                 ("cli_writes_mcp_tool_trace", any(e.get("tool_name") == "mcp__audit_echo"
                   and e.get("content") == "pong" and e.get("arguments") == {"text": "pong"} for e in payloads)),
-                ("cli_default_indexes_do_not_repeat_model_or_tool_payloads",
-                 all("request" not in e and "chatml" not in e for e in audit_entries)
-                 and all("content" not in e and "arguments" not in e for e in entries)),
+                ("cli_default_output_is_readable_json_without_jsonl_indexes",
+                 bool(documents) and not os.path.exists(path) and not os.path.exists(os.path.join(directory, "tools.jsonl"))
+                 and all("thinking" in t and "tool_calls" in t for d in documents for t in d["turns"])),
             ]
         finally:
             process.terminate()
@@ -435,7 +433,8 @@ def shim_route_regressions():
 
 def session_archive_regressions(directory_parent=None):
     from test_incremental import run_checks
-    return run_checks(directory_parent)
+    from test_readable_json import run_checks as readable_checks
+    return run_checks(directory_parent) + readable_checks(directory_parent)
 
 
 def windows_launcher_regressions():
@@ -464,11 +463,11 @@ def windows_launcher_regressions():
             raise RuntimeError("Windows launcher probe failed: " + result.stderr)
         observed = json.loads(result.stdout)
         args = observed["args"]
-        expected_log = os.path.join(os.path.dirname(launcher), "..", "audit.jsonl")
+        expected_log = os.path.join(os.path.dirname(launcher), "..")
         checks = [
             ("windows_launcher_preserves_project_directory", observed["cwd"] == project),
             ("windows_launcher_uses_parent_log_directory",
-             os.path.normpath(args[args.index("--log") + 1]) == os.path.normpath(expected_log)),
+             os.path.normpath(args[args.index("--sessions-dir") + 1]) == os.path.normpath(expected_log)),
             ("windows_launcher_forwards_arguments_and_exit_code",
              args[-3:] == ["--", "--model", "fixture/model id"] and result.returncode == 7),
         ]
@@ -476,8 +475,8 @@ def windows_launcher_regressions():
         environment["OMP_AUDIT_LOG_DIR"] = override
         override_args = json.loads(run().stdout)["args"]
         checks.append(("windows_launcher_accepts_log_directory_override",
-                       os.path.normpath(override_args[override_args.index("--log") + 1]) ==
-                       os.path.normpath(os.path.join(override, "audit.jsonl"))))
+                       os.path.normpath(override_args[override_args.index("--sessions-dir") + 1]) ==
+                       os.path.normpath(override)))
         return checks
 
 
@@ -495,6 +494,7 @@ def real_omp_smoke(api="openai-completions"):
             fh.write("AUDIT_READ_OK\n")
         requests = []
         request_paths = []
+        fixture_thinking = "AUDIT_THINK_FULL\n完整的模拟思考文本"
         is_anthropic = api == "anthropic-messages"
         base_path = "/gateway/v1" if is_anthropic else "/v1"
         expected_path = base_path + ("/messages" if is_anthropic else "/chat/completions")
@@ -524,7 +524,7 @@ def real_omp_smoke(api="openai-completions"):
                         isinstance(m.get("content"), list) and any(
                             isinstance(block, dict) and block.get("type") == "tool_result"
                             for block in m["content"]) for m in messages)
-                delta = {"role": "assistant"}
+                delta = {"role": "assistant", "reasoning_content": fixture_thinking}
                 if completed:
                     delta["content"] = "AUDIT_LOCAL_OK"
                 else:
@@ -548,9 +548,14 @@ def real_omp_smoke(api="openai-completions"):
                          "type": "message", "role": "assistant", "model": "fixture", "content": [],
                          "stop_reason": None, "stop_sequence": None,
                          "usage": {"input_tokens": 10, "output_tokens": 0}}},
-                        {"type": "content_block_start", "index": 0, "content_block": content},
-                        {"type": "content_block_delta", "index": 0, "delta": content_delta},
+                        {"type": "content_block_start", "index": 0,
+                         "content_block": {"type": "thinking", "thinking": ""}},
+                        {"type": "content_block_delta", "index": 0,
+                         "delta": {"type": "thinking_delta", "thinking": fixture_thinking}},
                         {"type": "content_block_stop", "index": 0},
+                        {"type": "content_block_start", "index": 1, "content_block": content},
+                        {"type": "content_block_delta", "index": 1, "delta": content_delta},
+                        {"type": "content_block_stop", "index": 1},
                         {"type": "message_delta", "delta": {"stop_reason": "end_turn" if completed else "tool_use",
                          "stop_sequence": None}, "usage": {"output_tokens": 5}},
                         {"type": "message_stop"},
@@ -591,12 +596,15 @@ def real_omp_smoke(api="openai-completions"):
                 raise RuntimeError("Real OMP smoke failed: " + run.stderr[-6500:] + run.stdout[-2500:])
             with open(models_path, "rb") as fh:
                 unchanged = fh.read() == original
-            with open(os.path.join(directory, "logs", "tools.jsonl"), encoding="utf-8") as fh:
-                events = [json.loads(line) for line in fh if line.strip()]
-            tool_results = [e for e in events if e.get("event") == "tool_result"]
             session_archives = list(ap.iter_session_records(os.path.join(directory, "logs")))
             tool_results = [e for archive in session_archives for e in archive.get("tool_trace", [])
                             if e.get("event") == "tool_result"]
+            documents = []
+            for name in os.listdir(os.path.join(directory, "logs")):
+                if name.startswith("session-") and name.endswith("-rl.json"):
+                    with open(os.path.join(directory, "logs", name), encoding="utf-8") as fh:
+                        documents.append(json.load(fh))
+            readable_turns = [turn for document in documents for turn in document["turns"]]
             before_failed_run = len(requests)
             configuration["providers"]["audit-fixture"]["models"].append({
                 "id": "other", "baseUrl": f"http://127.0.0.1:{mock.server_port}/different/v1"})
@@ -611,6 +619,13 @@ def real_omp_smoke(api="openai-completions"):
                 ("real_omp_read_tool_audited", any(e.get("tool_name") == "read"
                   and "AUDIT_READ_OK" in str(e.get("content")) and e.get("correlated") for e in tool_results)),
                 ("real_omp_two_model_rounds_forwarded", len(requests) >= 2),
+                ("real_omp_readable_json_keeps_full_thinking", len(readable_turns) == 2
+                 and all(turn["thinking"] == fixture_thinking for turn in readable_turns)),
+                ("real_omp_readable_json_keeps_tool_arguments_and_result",
+                 any(call.get("tool_name") == "read" and call.get("arguments") == {"path": fixture}
+                     for turn in readable_turns for call in turn["tool_calls"])
+                 and any(result.get("tool_name") == "read" and "AUDIT_READ_OK" in str(result.get("content"))
+                         for turn in readable_turns for result in turn["tool_results"])),
                 ("real_omp_exports_incremental_journal_with_tool_result", len(session_archives) == 2
                  and any(event.get("event") == "tool_result" and "AUDIT_READ_OK" in str(event.get("content"))
                          for archive in session_archives for event in archive["tool_trace"])),

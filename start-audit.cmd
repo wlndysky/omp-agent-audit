@@ -8,6 +8,6 @@ if not exist "%AUDIT_SCRIPT%" (
     echo [audit] Cannot find omp_audit_proxy.py beside this launcher. 1>&2
     exit /b 2
 )
-python -B -u -X utf8 "%AUDIT_SCRIPT%" --log "%AUDIT_LOG_DIR%\audit.jsonl" %*
+python -B -u -X utf8 "%AUDIT_SCRIPT%" --sessions-dir "%AUDIT_LOG_DIR%" %*
 set "AUDIT_EXIT=%ERRORLEVEL%"
 endlocal & exit /b %AUDIT_EXIT%
