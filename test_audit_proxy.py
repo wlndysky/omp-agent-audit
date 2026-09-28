@@ -111,7 +111,7 @@ class MockUpstream(BaseHTTPRequestHandler):
         elif self.path.startswith("/up-oai/chat/completions"):
             self._sse(OPENAI_SSE)
         elif self.path.startswith("/up-noid/chat/completions"):
-            self._sse(NOID_SSE)
+            self._sse(NOID_SSE, {"x-request-id": "request-only-not-a-response"})
         elif self.path.startswith("/up-responses/responses"):
             if request.get("stream"):
                 self._sse(RESPONSES_SSE)
@@ -377,6 +377,135 @@ def launcher_regressions():
     return checks
 
 
+def session_archive_regressions(directory_parent=None):
+    checks = []
+    def record(exchange, response_id=None, first_user="first prompt"):
+        body = {"messages": [{"role": "system", "content": "fixture system"},
+                              {"role": "user", "content": first_user}]}
+        ids = [{"id": "request-only", "source": "header:x-request-id", "confidence": "high"}]
+        if response_id:
+            ids.append({"id": response_id, "source": "body:json.id", "confidence": "high"})
+        return {"exchange_id": exchange, "protocol": "openai-completions",
+                "request": {"body": body}, "classification": {"ids": ids},
+                "chatml": {"messages": [*body["messages"],
+                           {"role": "assistant", "content": "fixture answer", "thinking": "visible reasoning"}]},
+                "tool_trace": [{"event": "tool_call", "tool_name": "read", "arguments": {"path": "fixture"}}]}
+    with tempfile.TemporaryDirectory(prefix="omp-audit-sessions-", dir=directory_parent) as directory:
+        writer = ap.SessionJsonWriter(directory)
+        first = record("a", "resp_fixture")
+        response_path = writer.write(first)
+        with open(response_path, encoding="utf-8") as fh:
+            response_archive = json.load(fh)
+        checks.append(("session_filename_uses_response_id", os.path.basename(response_path) == "session-resp_fixture-rl.json"))
+        checks.append(("session_json_keeps_chatml_thinking_tools_and_raw_exchange",
+                       response_archive["messages"][-1]["thinking"] == "visible reasoning"
+                       and response_archive["tool_trace"][0]["tool_name"] == "read"
+                       and response_archive["exchanges"][0]["request"] == first["request"]))
+        noid = record("b")
+        fallback = ap.fallback_stream_id(noid["protocol"], noid["request"]["body"])
+        hash_path = writer.write(noid)
+        checks.append(("session_without_response_uses_context_hash_not_request_id",
+                       os.path.basename(hash_path) == "session-sha256-" + fallback.split(":", 1)[1] + "-rl.json"
+                       and noid["classification"]["primary_id"] == fallback))
+        later = record("c")
+        later["request"]["body"]["messages"].extend([
+            {"role": "system", "content": "later context"}, {"role": "user", "content": "later prompt"}])
+        later_path = ap.SessionJsonWriter(directory).write(later)
+        writer.write(later)
+        with open(hash_path, encoding="utf-8") as fh:
+            grouped = json.load(fh)
+        checks.append(("session_hash_stays_stable_after_first_user", later_path == hash_path))
+        checks.append(("session_reexport_is_idempotent_and_restart_keeps_rounds", grouped["exchange_count"] == 2))
+        distinct = writer.write(record("d", first_user="different first prompt"))
+        checks.append(("session_distinct_first_user_gets_distinct_file", distinct != hash_path))
+        unsafe_path = writer.write(record("e", "../../outside:fixture"))
+        checks.append(("session_filename_cannot_escape_output_directory",
+                       os.path.dirname(unsafe_path) == directory and os.path.basename(unsafe_path).startswith("session-")))
+        unsupported = record("f")
+        unsupported["request"]["body"] = {}
+        unknown_path = writer.write(unsupported)
+        checks.append(("session_missing_initial_context_is_explicitly_unclassified",
+                       os.path.basename(unknown_path) == "session-unclassified-f-rl.json"))
+        response_header = ap.classify_ids([
+            {"id": "req_fixture", "source": "header:request-id", "confidence": "high"},
+            {"id": "resp_header_fixture", "source": "header:x-response-id", "confidence": "high"}], fallback)
+        checks.append(("session_accepts_explicit_response_id_header", response_header["primary_id"] == "resp_header_fixture"))
+        with open(response_path, "w", encoding="utf-8") as fh:
+            fh.write("invalid existing archive")
+        refused = False
+        try:
+            writer.write(record("g", "resp_fixture"))
+        except ValueError:
+            refused = True
+        with open(response_path, encoding="utf-8") as fh:
+            checks.append(("session_does_not_overwrite_corrupted_existing_archive",
+                           refused and fh.read() == "invalid existing archive"))
+        concurrent_dir = os.path.join(directory, "concurrent")
+        worker = ("import json, sys; from omp_audit_proxy import SessionJsonWriter; "
+                  "w=SessionJsonWriter(sys.argv[1]); r=json.loads(sys.argv[2]); "
+                  "[(r.update(exchange_id=sys.argv[3]+'-'+str(i)), w.write(r)) for i in range(3)]")
+        processes = [subprocess.Popen([sys.executable, "-B", "-X", "utf8", "-c", worker, concurrent_dir,
+                     json.dumps(record("concurrent")), str(i)], cwd=os.path.dirname(os.path.abspath(ap.__file__)),
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0) for i in range(3)]
+        try:
+            for process in processes:
+                process.communicate(timeout=20)
+            with open(os.path.join(concurrent_dir, ap.session_filename(fallback)), encoding="utf-8") as fh:
+                concurrent = json.load(fh)
+            checks.append(("session_concurrent_processes_keep_all_exchanges",
+                           all(p.returncode == 0 for p in processes) and concurrent["exchange_count"] == 9))
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+    return checks
+
+
+def windows_launcher_regressions():
+    if os.name != "nt":
+        return []
+    launcher = os.path.join(os.path.dirname(os.path.abspath(ap.__file__)), "start-audit.cmd")
+    with tempfile.TemporaryDirectory(prefix="omp-audit-cmd-") as directory:
+        project = os.path.join(directory, "project with spaces")
+        os.makedirs(project)
+        probe = os.path.join(directory, "probe.py")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("import json, os, sys\nprint(json.dumps({'args': sys.argv[1:], 'cwd': os.getcwd()}))\n"
+                     "raise SystemExit(7)\n")
+        with open(os.path.join(project, "python.cmd"), "w", encoding="utf-8") as fh:
+            fh.write('@echo off\n"' + sys.executable + '" "' + probe + '" %*\n')
+        environment = os.environ.copy()
+        environment.pop("OMP_AUDIT_LOG_DIR", None)
+        command = '""' + launcher + '" -- --model "fixture/model id""'
+        def run():
+            shell_command = '"' + os.environ.get("COMSPEC", "cmd.exe") + '" /d /s /c ' + command
+            return subprocess.run(shell_command,
+                cwd=project, env=environment, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+        result = run()
+        if not result.stdout.strip():
+            raise RuntimeError("Windows launcher probe failed: " + result.stderr)
+        observed = json.loads(result.stdout)
+        args = observed["args"]
+        expected_log = os.path.join(os.path.dirname(launcher), "..", "audit.jsonl")
+        checks = [
+            ("windows_launcher_preserves_project_directory", observed["cwd"] == project),
+            ("windows_launcher_uses_parent_log_directory",
+             os.path.normpath(args[args.index("--log") + 1]) == os.path.normpath(expected_log)),
+            ("windows_launcher_forwards_arguments_and_exit_code",
+             args[-3:] == ["--", "--model", "fixture/model id"] and result.returncode == 7),
+        ]
+        override = os.path.join(directory, "custom logs")
+        environment["OMP_AUDIT_LOG_DIR"] = override
+        override_args = json.loads(run().stdout)["args"]
+        checks.append(("windows_launcher_accepts_log_directory_override",
+                       os.path.normpath(override_args[override_args.index("--log") + 1]) ==
+                       os.path.normpath(os.path.join(override, "audit.jsonl"))))
+        return checks
+
+
 def real_omp_smoke(api="openai-completions"):
     """Optional real OMP + fake provider, using an isolated temporary agent dir."""
     if not shutil.which("omp"):
@@ -490,6 +619,12 @@ def real_omp_smoke(api="openai-completions"):
             with open(os.path.join(directory, "logs", "tools.jsonl"), encoding="utf-8") as fh:
                 events = [json.loads(line) for line in fh if line.strip()]
             tool_results = [e for e in events if e.get("event") == "tool_result"]
+            expected_files = ["session-" + ("msg" if is_anthropic else "chatcmpl") +
+                              "-fixture-" + str(i) + "-rl.json" for i in (1, 2)]
+            session_archives = []
+            for filename in expected_files:
+                with open(os.path.join(directory, "logs", filename), encoding="utf-8") as fh:
+                    session_archives.append(json.load(fh))
             before_failed_run = len(requests)
             configuration["providers"]["audit-fixture"]["models"].append({
                 "id": "other", "baseUrl": f"http://127.0.0.1:{mock.server_port}/different/v1"})
@@ -504,6 +639,9 @@ def real_omp_smoke(api="openai-completions"):
                 ("real_omp_read_tool_audited", any(e.get("tool_name") == "read"
                   and "AUDIT_READ_OK" in str(e.get("content")) and e.get("correlated") for e in tool_results)),
                 ("real_omp_two_model_rounds_forwarded", len(requests) >= 2),
+                ("real_omp_exports_response_named_json_with_tool_result", len(session_archives) == 2
+                 and any(event.get("event") == "tool_result" and "AUDIT_READ_OK" in str(event.get("content"))
+                         for archive in session_archives for event in archive["tool_trace"])),
                 ("real_omp_exact_upstream_paths", len(request_paths) == 2
                  and all(path.split("?", 1)[0] == expected_path for path in request_paths)),
                 ("real_omp_unsafe_routing_stops_before_inference", failed.returncode != 0
@@ -537,6 +675,7 @@ def main():
     ap.AuditHandler.routes = routes
     ap.AuditHandler.logger = ap.JsonlLogger(logpath, max_bytes=10 * 1024 * 1024, backups=2)
     ap.AuditHandler.tool_logger = ap.JsonlLogger(toolpath)
+    ap.AuditHandler.session_writer = ap.SessionJsonWriter(logdir)
     ap.TOOL_TRACE = ap.ToolTraceTracker()
     ap.AuditHandler.upstream_connect_timeout = 5.0
 
@@ -653,6 +792,18 @@ def main():
     with open(logpath, encoding="utf-8") as fh:
         lines = [json.loads(x) for x in fh if x.strip()]
     raw_log = open(logpath, encoding="utf-8").read()
+    session_paths = [os.path.join(logdir, name) for name in os.listdir(logdir)
+                     if name.startswith("session-") and name.endswith("-rl.json")]
+    session_documents = []
+    for session_path in session_paths:
+        with open(session_path, encoding="utf-8") as fh:
+            session_documents.append(json.load(fh))
+    results.append(("session_archives_cover_all_recorded_exchanges",
+                    {item["exchange_id"] for doc in session_documents for item in doc["exchanges"]} ==
+                    {item["exchange_id"] for item in lines if item.get("request")}))
+    results.append(("session_archives_do_not_reintroduce_redacted_headers",
+                    all(secret not in json.dumps(session_documents)
+                        for secret in (SECRET_HEADER, SECRET_APIKEY, SECRET_COOKIE, SECRET_QUERY))))
 
     by_path = {}
     noid_records = []
@@ -747,6 +898,8 @@ def main():
         and e.get("content") == "pong" for e in tool_lines)))
     results.extend(tool_regressions())
     results.extend(launcher_regressions())
+    results.extend(session_archive_regressions())
+    results.extend(windows_launcher_regressions())
     if "--real-omp" in sys.argv:
         results.extend(real_omp_smoke())
         results.extend(real_omp_smoke("anthropic-messages"))

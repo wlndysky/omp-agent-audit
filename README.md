@@ -13,7 +13,7 @@ A local LLM API audit proxy for OMP built-in tools, MCP tools, and model context
 - 单文件 Python，纯标准库，仅监听 `127.0.0.1`。
 - 支持 Anthropic Messages、OpenAI-compatible Chat Completions 和 Responses 的 JSON / SSE 报文。
 - 记录请求、响应、API 返回的 thinking/reasoning、工具调用参数及后续上下文回传的结果。
-- 输出派生 ChatML 视图和独立工具轨迹，记录上游响应/请求 ID；无 ID 时使用 system + 首条 user 的哈希作为分组提示。
+- 按 response ID 输出 `session-<id>-rl.json`，包含派生 ChatML 和工具轨迹；无 response ID 时使用 system → 首条 user 的 SHA-256 哈希分文件。请求 ID 只作为附加元数据。
 - 从请求历史恢复 OMP/MCP 工具名、参数和结果；重复历史会标记，无法确定的原始调用来源保留为空。
 - 不内置个人模型、上游地址、API Key 或 agent 配置。
 
@@ -39,6 +39,8 @@ python omp_audit_proxy.py -- --model "provider/model-id"
 ```
 
 `--omp-executable` 可指定 OMP 可执行文件完整路径。脚本可以放在 NAS 共享目录，但它在哪台电脑执行，就在哪台电脑启动代理和 OMP。
+
+Windows 也可从项目终端调用 `start-audit.cmd` 的完整路径。它与 Python 文件放在同一目录，不切换当前项目目录，并把 `audit.jsonl`、`tools.jsonl` 写入脚本目录的上一级。参数原样传递，例如 `start-audit.cmd -- --continue`；可用环境变量 `OMP_AUDIT_LOG_DIR` 指定其他日志目录。要保留项目上下文，请在项目终端调用，不要直接双击。
 
 ### 仅代理模式（可选）
 
@@ -74,10 +76,15 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 
 - `audit.jsonl`：每次 HTTP 交换的请求/响应、解析后的 SSE 事件、ID 分类、ChatML 和工具轨迹。
 - `tools.jsonl`：每条工具事件单独一行，便于检索工具名、参数、结果和跨轮关联。
+- `session-<response-id>-rl.json`：按真实响应 ID 分类的独立 JSON；没有响应 ID 时命名为 `session-sha256-<hash>-rl.json`。默认与 `audit.jsonl` 同目录，也可用 `--sessions-dir` 指定。
+
+分类 JSON 的 `messages` 是最新一轮的派生 ChatML，`tool_trace` 汇总该文件中的工具轨迹，`exchanges` 保留各次请求/响应、API 可见的推理和证据。相同 ID/哈希的多轮追加到同一文件；重复导出同一 exchange 不会重复添加。文件使用锁和原子替换，已有文件损坏时拒绝覆盖并报告错误。文件名中不安全、过长或可能造成大小写冲突的 ID 会加哈希后缀，原始 ID 仍在 JSON 中保留。
+
+`request-id`/`x-request-id` 不冒充 response ID。若响应 ID 和初始上下文都不可得，使用明确标记的 `session-unclassified-<exchange-id>-rl.json`。相同初始上下文的不同会话可能产生同一哈希，因此哈希只是分组线索，不是严格会话身份。
 
 工具事件的 `event` 为 `tool_call`（当前响应中的调用）、`tool_call_context`（历史调用）或 `tool_result`（上下文回传的结果）。调用记录不等于执行成功。`replayed_context` 标记重复结果；`call_exchange_ambiguous` 表示原始交换来源有歧义。`tool_kind_hint` 仅按名称分类，不是身份认证；错误状态未报告时 `is_error` 为 `null`，不擅自判定成功。
 
-日志保持追加写入，不回写旧记录，也不为每个 response ID 单独建文件。跨请求来源缓存有界且仅在内存中；代理重启后仍可从请求历史恢复工具内容，但不会虚构原始 exchange ID。
+JSONL 总日志保持追加写入；独立分类 JSON 在每次响应结束后更新，异常断连时保留已捕获部分及相应标记。分类 JSON 不随总日志轮转删除，请自行安排存储清理；`.session-locks/` 仅保存写入锁文件。跨请求来源缓存有界且仅在内存中；代理重启后仍可从请求历史恢复工具内容，但不会虚构原始 exchange ID。
 
 ```bash
 python omp_audit_proxy.py --help
@@ -111,7 +118,7 @@ python -B -X utf8 test_audit_proxy.py
 - One Python file, standard library only, bound to `127.0.0.1`.
 - JSON and SSE handling for Anthropic Messages, OpenAI-compatible Chat Completions, and Responses.
 - Captures requests, responses, API-exposed thinking/reasoning, tool arguments, and results returned in subsequent model context.
-- Produces a derived ChatML view and a separate tool-event log. Records carry response/request IDs; a system + first-user hash is a low-confidence grouping hint when no upstream ID exists.
+- Writes `session-<id>-rl.json` archives with derived ChatML and tool traces, grouped by response ID or a system-to-first-user SHA-256 hash when absent. Request IDs remain additional metadata.
 - Recovers OMP/MCP tool names, arguments, and results from request history, including after a proxy restart. Repeated context is marked; ambiguous origins are not guessed.
 - No personal models, upstream endpoints, API keys, or agent configuration are bundled.
 
@@ -137,6 +144,8 @@ python omp_audit_proxy.py -- --model "provider/model-id"
 ```
 
 Use `--omp-executable` for an explicit executable path. The script may live on a NAS share; the proxy and OMP run on the machine executing it.
+
+On Windows, invoke the full path to `start-audit.cmd` from your project terminal. Keep it beside the Python file. It preserves the working directory and writes `audit.jsonl` and `tools.jsonl` to the parent of the script directory. Arguments pass through unchanged, e.g. `start-audit.cmd -- --continue`. Set `OMP_AUDIT_LOG_DIR` to override the log directory. Invoke it from the project terminal rather than double-clicking to retain project context.
 
 ### Proxy-only mode (optional)
 
@@ -172,10 +181,15 @@ One-command launches write to `audit-logs/<run-id>/` beside the script, isolatin
 
 - `audit.jsonl`: HTTP exchanges, parsed SSE events, ID classification, derived ChatML, and tool traces.
 - `tools.jsonl`: one tool event per line, including names, arguments, results, and correlation fields.
+- `session-<response-id>-rl.json`: a separate JSON archive for each response ID, or `session-sha256-<hash>-rl.json` when it is absent. Files default to the same directory as `audit.jsonl`; override with `--sessions-dir`.
+
+Each archive exposes the latest derived ChatML in `messages`, aggregated tool events in `tool_trace`, and captured requests/responses, API-visible reasoning, and evidence in `exchanges`. Repeated IDs/hashes accumulate exchanges rather than overwrite them; re-exporting the same exchange is idempotent. File locks and atomic replacement protect writes, and corrupt existing files are not overwritten. Unsafe, overlong, or case-sensitive IDs receive a hash suffix in the filename; their original values remain in the JSON.
+
+Request IDs are metadata, not substitutes for response IDs. When neither a response ID nor the initial context is available, files are explicitly named `session-unclassified-<exchange-id>-rl.json`. Identical initial contexts can share a hash across distinct conversations; hashes are grouping hints, not authenticated session identities.
 
 Event types are `tool_call` (current response), `tool_call_context` (historical call), and `tool_result` (result echoed in context). An observed call is not proof of successful execution. `replayed_context` marks repeated results; `call_exchange_ambiguous` flags uncertain origins. `tool_kind_hint` is name-based, not an authenticated identity. An unreported error status is `null`, not assumed success.
 
-Logs are append-only. Classification fields do not create separate files for each response ID. The cross-request cache is bounded and in-memory; after restart, context can recover tool contents but not missing original exchange IDs.
+JSONL indexes are append-only; separate session JSON files update after each response, retaining captured data and markers on interrupted streams. Session archives are not deleted by JSONL rotation, so manage their storage separately. The `.session-locks/` directory only holds writer locks. The cross-request cache is bounded and in-memory; after restart, context can recover tool contents but not missing original exchange IDs.
 
 ```bash
 python omp_audit_proxy.py --help

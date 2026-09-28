@@ -20,7 +20,8 @@ omp_audit_proxy.py — 本地（127.0.0.1-only）LLM API 流式审计反向代�
   - openai-completions:  POST {baseUrl}/chat/completions
   - openai-responses:    POST {baseUrl}/responses
 
-输出：audit.jsonl 保存报文与 ChatML；tools.jsonl 单独保存 OMP 内置/MCP 工具轨迹。
+输出：session-<response-id>-rl.json 按响应 ID 保存独立 JSON；缺 ID 时使用初始上下文哈希。
+audit.jsonl 保留总记录；tools.jsonl 单独保存 OMP 内置/MCP 工具轨迹。
 工具结果包含工具名、参数、返回内容、调用/结果 exchange ID、来源与重复历史标记。
 直接运行本脚本可启动代理和 OMP，使用临时扩展，不修改原模型配置。
 路由可用 --route /local/=https://upstream.example/v1=openai-completions 自定义。
@@ -46,6 +47,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import OrderedDict
+from contextlib import contextmanager
 import hashlib
 import hmac
 import http.client
@@ -53,6 +55,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import secrets
 import shutil
 import ssl
@@ -238,6 +241,127 @@ class JsonlLogger:
 
 
 # --------------------------------------------------------------------------
+# Per-response JSON archives, independent of the rotating JSONL index.
+# --------------------------------------------------------------------------
+
+
+def classify_ids(ids: list[dict], fallback: str | None) -> dict:
+    candidates = [dict(item) for item in ids if isinstance(item, dict)
+                  and isinstance(item.get("id"), str) and item["id"]]
+    primary = next((item for item in candidates if str(item.get("source", "")).startswith("body:")
+                    or item.get("source") in ("header:response-id", "header:x-response-id")), None)
+    if fallback:
+        hint = {"id": fallback, "source": "fallback:system+first_user.sha256", "confidence": "low"}
+        if not any(item.get("id") == fallback and item.get("source") == hint["source"] for item in candidates):
+            candidates.append(hint)
+        primary = primary or hint
+    return {"ids": candidates, "primary_id": primary["id"] if primary else None,
+            "primary_source": primary.get("source") if primary else None,
+            "confidence": primary.get("confidence", "high") if primary else "none"}
+
+
+def session_filename(stream_id: str) -> str:
+    value = stream_id.removeprefix("sha256:") if stream_id.startswith("sha256:") else stream_id
+    if stream_id.startswith("sha256:"):
+        value = "sha256-" + value
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", value)[:120]
+    if safe != value or not safe or value != value.lower():
+        safe = (safe or "id") + "-" + hashlib.sha256(stream_id.encode()).hexdigest()[:16]
+    return "session-" + safe + "-rl.json"
+
+
+@contextmanager
+def _session_file_lock(path: str):
+    # Persistent lock files avoid unlink/recreate races between proxy processes.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a+b") as handle:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Session archive lock timed out")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class SessionJsonWriter:
+    """One complete JSON file per response ID, otherwise per initial-context hash."""
+
+    def __init__(self, directory: str):
+        self.directory = os.path.abspath(directory)
+        self.lock = threading.Lock()
+        os.makedirs(self.directory, exist_ok=True)
+
+    def flush(self) -> None:
+        # Let an in-progress atomic write finish before a normal process exit.
+        with self.lock:
+            pass
+
+    def write(self, record: dict) -> str | None:
+        if not record.get("request") or not record.get("protocol"):
+            return None  # Health checks and unrelated requests are not sessions.
+        request = record["request"]
+        fallback = fallback_stream_id(record["protocol"], request.get("body"))
+        if not fallback and str(record.get("conversation_hint", "")).startswith("sha256:"):
+            fallback = record["conversation_hint"]
+        grouping = classify_ids((record.get("classification") or {}).get("ids", []), fallback)
+        stream_id = grouping["primary_id"] or "unclassified-" + record["exchange_id"]
+        record["classification"] = grouping
+        name = session_filename(stream_id)
+        record["session_file"] = name
+        path = os.path.join(self.directory, name)
+        lock_path = os.path.join(self.directory, ".session-locks", name + ".lock")
+        with self.lock, _session_file_lock(lock_path):
+            archive = {"schema_version": 1, "stream_id": stream_id, "classification": grouping,
+                       "chatml_derived": True, "chatml_lossy": True, "messages": [],
+                       "tool_trace": [], "exchanges": []}
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as fh:
+                    archive = json.load(fh)
+                if (not isinstance(archive, dict) or archive.get("stream_id") != stream_id
+                        or not isinstance(archive.get("exchanges"), list)):
+                    raise ValueError("Refusing to overwrite an incompatible session archive")
+            if any(item.get("exchange_id") == record["exchange_id"] for item in archive["exchanges"]):
+                return path  # Re-exporting an existing exchange is idempotent.
+            archive["exchanges"].append(record)
+            archive["exchanges"].sort(key=lambda item: (item.get("ts_epoch", 0), item["exchange_id"]))
+            latest = archive["exchanges"][-1]
+            archive["messages"] = (latest.get("chatml") or {}).get("messages", [])
+            archive["tool_trace"] = [event for item in archive["exchanges"] for event in item.get("tool_trace", [])]
+            archive["exchange_count"] = len(archive["exchanges"])
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=".session-write-",
+                                                 suffix=".tmp", dir=self.directory, delete=False) as fh:
+                    temporary = fh.name
+                    json.dump(archive, fh, ensure_ascii=False, indent=2, default=str)
+                    fh.write("\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(temporary, path)
+            finally:
+                if temporary and os.path.exists(temporary):
+                    os.unlink(temporary)
+        return path
+
+
+# --------------------------------------------------------------------------
 # 工具：脱敏 / 协议识别 / fallback hash / ChatML 派生
 # --------------------------------------------------------------------------
 
@@ -291,14 +415,18 @@ def fallback_stream_id(protocol: str, body) -> str | None:
         if isinstance(msgs, str):
             first_user = msgs
             msgs = []
-        sys_parts = [m.get("content") for m in msgs if isinstance(m, dict) and m.get("role") in ("system", "developer")]
+        sys_parts = []
         if body.get("instructions"):
-            sys_parts.insert(0, body["instructions"])
-        system = sys_parts if sys_parts else None
+            sys_parts.append(body["instructions"])
         for m in msgs:
-            if isinstance(m, dict) and m.get("role") == "user":
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") in ("system", "developer"):
+                sys_parts.append(m.get("content"))
+            if m.get("role") == "user":
                 first_user = m.get("content")
                 break
+        system = sys_parts if sys_parts else None
     if system is None and first_user is None:
         return None
     digest = hashlib.sha256(_canon({"system": system, "first_user": first_user}).encode("utf-8")).hexdigest()
@@ -848,6 +976,7 @@ class AuditHandler(BaseHTTPRequestHandler):
     routes: list[Route] = []
     logger: JsonlLogger | None = None
     tool_logger: JsonlLogger | None = None
+    session_writer: SessionJsonWriter | None = None
     control_token: str | None = None
     route_lock = threading.Lock()
     upstream_connect_timeout = 30.0
@@ -915,6 +1044,12 @@ class AuditHandler(BaseHTTPRequestHandler):
             self.close_connection = True
         finally:
             record["duration_ms"] = round((time.time() - started) * 1000)
+            if self.session_writer:
+                try:
+                    self.session_writer.write(record)
+                except (OSError, ValueError, TypeError) as exc:
+                    record["session_export_error"] = type(exc).__name__
+                    print(f"[audit] session JSON export failed: {exc}", file=sys.stderr)
             if self.logger:
                 self.logger.write(record)
             if self.tool_logger:
@@ -1100,7 +1235,8 @@ class AuditHandler(BaseHTTPRequestHandler):
         }
         # 响应头里的 request-id 类 ID
         header_ids = []
-        for name in ("request-id", "x-request-id", "anthropic-request-id", "openai-request-id", "x-completion-id"):
+        for name in ("response-id", "x-response-id", "request-id", "x-request-id",
+                     "anthropic-request-id", "openai-request-id", "x-completion-id"):
             v = resp.getheader(name)
             if v:
                 header_ids.append({"id": v, "source": f"header:{name}", "confidence": "high"})
@@ -1209,15 +1345,7 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         ids.extend(header_ids)
         fallback = fallback_stream_id(protocol, body_json)
-        if fallback:
-            ids.append({"id": fallback, "source": "fallback:system+first_user.sha256", "confidence": "low"})
-        primary = next((i for i in ids if i["confidence"] == "high"), None) or (ids[0] if ids else None)
-        record["classification"] = {
-            "ids": ids,
-            "primary_id": primary["id"] if primary else None,
-            "primary_source": primary["source"] if primary else None,
-            "confidence": primary["confidence"] if primary else "none",
-        }
+        record["classification"] = classify_ids(ids, fallback)
 
         # ---- ChatML 派生视图（有损，不替代原始格式） ----
         chatml = derive_chatml_request(protocol, body_json)
@@ -1343,6 +1471,7 @@ def main(argv=None) -> int:
     ap.add_argument("--log-max-bytes", type=int, default=64 * 1024 * 1024)
     ap.add_argument("--log-backups", type=int, default=5)
     ap.add_argument("--tools-log", help="独立工具轨迹 JSONL，默认与 --log 同目录下的 tools.jsonl")
+    ap.add_argument("--sessions-dir", help="分类 JSON 文件目录，默认与 --log 同目录")
     ap.add_argument("--route", action="append", default=[],
                     help="上游路由 prefix=upstream 或 prefix=upstream=hint，可重复；仅代理模式至少配置一个")
     ap.add_argument("--upstream-connect-timeout", type=float, default=30.0)
@@ -1392,6 +1521,7 @@ def main(argv=None) -> int:
     handler.routes = routes
     handler.logger = JsonlLogger(args.log, args.log_max_bytes, args.log_backups)
     handler.tool_logger = JsonlLogger(tools_path, args.log_max_bytes, args.log_backups)
+    handler.session_writer = SessionJsonWriter(args.sessions_dir or os.path.dirname(os.path.abspath(args.log)))
     handler.upstream_connect_timeout = args.upstream_connect_timeout
     handler.verbose = args.verbose
     handler.control_token = secrets.token_urlsafe(32) if launch else None
@@ -1407,6 +1537,7 @@ def main(argv=None) -> int:
     print(f"[audit] listening on http://{args.host}:{server.server_address[1]}", file=sys.stderr)
     print(f"[audit] log: {args.log}", file=sys.stderr)
     print(f"[audit] tools: {tools_path}", file=sys.stderr)
+    print(f"[audit] sessions: {handler.session_writer.directory}", file=sys.stderr)
     for r in routes:
         print(f"[audit] route {r.prefix} -> {r.upstream} ({r.hint})", file=sys.stderr)
     try:
@@ -1417,6 +1548,7 @@ def main(argv=None) -> int:
         pass
     finally:
         server.server_close()
+        handler.session_writer.flush()
         handler.logger.close()
         handler.tool_logger.close()
     return 0

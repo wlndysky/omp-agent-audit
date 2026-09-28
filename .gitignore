@@ -5,6 +5,9 @@ logs/
 *.jsonl.*
 *.log
 *.log.*
+session-*-rl.json
+.session-locks/
+.session-write-*.tmp
 
 # Local credentials and agent configuration.
 .env
