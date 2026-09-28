@@ -166,6 +166,63 @@ def run_checks(directory_parent=None):
                        and resumed_path.read_bytes().startswith(legacy_bytes[:-len(cache_writer.FOOTER)])
                        and len(json.loads(resumed_path.read_text(encoding="utf-8"))["turns"]) == 2))
 
+        title_system = ("Write a ~5 word title using only the task described in the next user message.\n"
+                        "- You MUST ONLY answer with the title, inside the <title> tag.\nFixture instructions.")
+        def title_exchange(key, protocol, prompt):
+            if protocol == "anthropic-messages":
+                body = {"system": [{"type": "text", "text": title_system}], "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": prompt}]}]}
+            else:
+                body = {"messages": [{"role": "system", "content": title_system},
+                                     {"role": "user", "content": prompt}]}
+            return {"exchange_id": key, "protocol": protocol, "request": {"body": body},
+                    "response": {"status": 200}, "tool_trace": [],
+                    "classification": {"ids": [{"id": "resp_" + key, "source": "body:json.id"}]},
+                    "chatml": {"messages": ap.derive_chatml_request(protocol, body) + [
+                        {"role": "assistant", "thinking": "title thought " + key, "content": "<title>" + key + "</title>"}]}}
+        title_dir = root / "title-requests"
+        title_writer = ap.SessionJsonWriter(str(title_dir))
+        title_records = [title_exchange("title-a", "openai-completions", "task prompt"),
+                         title_exchange("title-b", "anthropic-messages", "task prompt"),
+                         title_exchange("title-c", "openai-completions", "task plus assistant context")]
+        title_path = Path(title_writer.write(title_records[0]))
+        title_prefix = title_path.read_bytes()[:-len(title_writer.FOOTER)]
+        main_path = Path(title_writer.write(copy.deepcopy(first)))
+        for record in title_records[1:]:
+            assert Path(title_writer.write(record)) == title_path
+        title_doc = json.loads(title_path.read_text(encoding="utf-8"))
+        checks.append(("automatic_titles_across_protocols_and_prompts_share_one_auxiliary_json",
+                       title_path == title_dir / "auxiliary" / "titles.json"
+                       and len(title_doc["turns"]) == 3 and len(list(title_dir.glob("*.json"))) == 1
+                       and main_path.parent == title_dir))
+        checks.append(("auxiliary_titles_append_without_rewriting_or_losing_reasoning",
+                       title_path.read_bytes().startswith(title_prefix)
+                       and [turn["thinking"] for turn in title_doc["turns"]]
+                       == ["title thought " + record["exchange_id"] for record in title_records]
+                       and all(turn["request_purpose"] == "title_generation" and turn.get("source_stream_id")
+                               for turn in title_doc["turns"])))
+        checks.append(("auxiliary_titles_deduplicate_system_and_keep_changed_prompt",
+                       sum(message.get("role") == "system" for turn in title_doc["turns"] for message in turn["input_messages"]) == 1
+                       and title_doc["turns"][-1]["input_messages"][-1]["content"] == "task plus assistant context"))
+        before_restart = title_path.read_bytes()
+        ap.SessionJsonWriter(str(title_dir)).write(copy.deepcopy(title_records[-1]))
+        checks.append(("auxiliary_title_restart_does_not_duplicate_or_recreate_root_files",
+                       title_path.read_bytes() == before_restart and len(list(title_dir.glob("*.json"))) == 1
+                       and len(list(ap.iter_session_records(str(title_dir)))) == 4))
+        ordinary = exchange("title-mentioned-in-user", [{"role": "user", "content": title_system}], "main thought")
+        ordinary_path = Path(title_writer.write(ordinary))
+        with_tools = title_exchange("title-system-with-tools", "openai-completions", "task prompt")
+        with_tools["request"]["body"]["tools"] = [{"type": "function", "function": {"name": "read"}}]
+        tools_path = Path(title_writer.write(with_tools))
+        checks.append(("ordinary_title_requests_and_tool_enabled_tasks_stay_in_main_output",
+                       ordinary_path.parent == title_dir and tools_path.parent == title_dir))
+        conflict_dir = root / "title-index-conflict"
+        conflict = subprocess.run([sys.executable, "-B", ap.__file__, "--proxy-only", "--port", "0",
+            "--route", "/fixture/=http://127.0.0.1:1=openai-completions", "--sessions-dir", str(conflict_dir),
+            "--indexes", "--log", str(conflict_dir / "auxiliary" / "titles.json")], capture_output=True, timeout=10)
+        checks.append(("title_auxiliary_json_rejects_index_path_collision_before_write",
+                       conflict.returncode == 2 and not conflict_dir.exists()))
+
         metadata_dir = root / "http-metadata"
         metadata = {"exchange_id": "usage-query", "method": "GET", "path": "/usages",
                     "protocol": "openai-completions", "request": {"body_bytes": 0},

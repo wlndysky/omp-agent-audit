@@ -20,7 +20,8 @@ omp_audit_proxy.py — 本地（127.0.0.1-only）LLM API 流式审计反向代�
   - openai-completions:  POST {baseUrl}/chat/completions
   - openai-responses:    POST {baseUrl}/responses
 
-输出：session-<稳定分组ID>-rl.json，每个响应链或 CRC32 组独立命名、只追加新轮次。
+输出：session-<稳定分组ID>-rl.json，每个主对话响应链或 CRC32 组只追加新轮次。
+OMP 自动标题统一增量追加到 auxiliary/titles.json，避免辅助请求堆积在主目录。
 .audit-state 保存内部增量恢复证据；audit.jsonl 和 tools.jsonl 索引默认不生成。
 工具结果包含工具名、参数、返回内容、调用/结果 exchange ID、来源与重复历史标记。
 直接运行本脚本可启动代理和 OMP，使用临时扩展，不修改原模型配置。
@@ -567,6 +568,7 @@ class SessionJsonWriter:
     """Human-readable JSON, adding new turns by replacing only the closing footer."""
 
     FOOTER = b"\n  ]\n}\n"
+    TITLE_STREAM = "auxiliary:titles"
 
     def __init__(self, directory):
         self.directory = os.path.abspath(directory)
@@ -579,15 +581,31 @@ class SessionJsonWriter:
 
     @staticmethod
     def filename(stream):
+        if stream == SessionJsonWriter.TITLE_STREAM:
+            return os.path.join("auxiliary", "titles.json")
         return session_filename(stream)[:-1]  # .json, not .jsonl
 
-    def _make_turn(self, record, frame):
+    @staticmethod
+    def document_stream(record, stream):
+        body = (record.get("request") or {}).get("body")
+        if not isinstance(body, dict) or body.get("tools") or record.get("tool_trace"):
+            return stream
+        messages = derive_chatml_request(record["protocol"], body)
+        system = "\n".join(_text_of(message.get("content")) or "" for message in messages
+                           if message.get("role") in ("system", "developer"))
+        title_prefix = ("Write a ~5 word title using only the task described in the next user message.\n"
+                        "- You MUST ONLY answer with the title, inside the <title> tag.")
+        if system.replace("\r\n", "\n").startswith(title_prefix):
+            return SessionJsonWriter.TITLE_STREAM
+        return stream
+
+    def _make_turn(self, record, frame, document_stream):
         messages = (record.get("chatml") or {}).get("messages", [])
         if (record.get("method") in ("GET", "HEAD", "OPTIONS") and not record.get("tool_trace")
                 and not any(message.get("content") or message.get("thinking") or message.get("tool_calls")
                             or message.get("tool_results") for message in messages)):
             return None  # Usage/model metadata remains in evidence, not an empty conversation JSON.
-        stream = frame["stream_id"]
+        stream = document_stream
         message_keys = self.messages_seen.setdefault(stream, set())
         call_keys = self.calls_seen.setdefault(stream, set())
         result_keys = self.results_seen.setdefault(stream, set())
@@ -633,6 +651,9 @@ class SessionJsonWriter:
                 "input_messages": new_inputs, "recovered_messages": recovered,
                 "thinking": assistant.get("thinking"), "content": assistant.get("content"),
                 "tool_calls": calls, "tool_results": results}
+        if document_stream == self.TITLE_STREAM:
+            turn["request_purpose"] = "title_generation"
+            turn["source_stream_id"] = frame["stream_id"]
         source_assistant = all_messages[-1] if assistant else {}
         if source_assistant.get("stop_reason"):
             turn["stop_reason"] = source_assistant["stop_reason"]
@@ -648,6 +669,7 @@ class SessionJsonWriter:
     def _write_document(self, stream):
         document = self.documents[stream]
         path = os.path.join(self.directory, self.filename(stream))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         existing = None
         if os.path.exists(path):
             try:
@@ -703,14 +725,17 @@ class SessionJsonWriter:
                 state = apply_json_delta(self.raw_states.get(stream, {}), frame["changes"])
                 if hashlib.sha256(_canon(state).encode()).hexdigest() != frame["state_sha256"]:
                     raise ValueError("Internal evidence checksum mismatch")
-                turn = self._make_turn(state, frame)
+                document_stream = self.document_stream(state, stream)
+                turn = self._make_turn(state, frame, document_stream)
                 if turn is not None:
-                    document = self.documents.setdefault(stream, {"schema_version": 3, "stream_id": stream,
-                        "grouped_by": frame["grouped_by"], "context_crc32": frame.get("context_crc32"),
+                    auxiliary = document_stream == self.TITLE_STREAM
+                    document = self.documents.setdefault(document_stream, {"schema_version": 3, "stream_id": document_stream,
+                        "grouped_by": "request_purpose" if auxiliary else frame["grouped_by"],
+                        "context_crc32": None if auxiliary else frame.get("context_crc32"),
                         "description": "New conversation content only; thinking and tool payloads are directly readable.",
                         "turns": []})
                     document["turns"].append(turn)
-                    self.dirty.add(stream)
+                    self.dirty.add(document_stream)
                 self.raw_states[stream], self.heads[stream] = state, frame["exchange_id"]
                 self.offsets[path] = self.offsets.get(path, 0) + length
         for stream in list(self.dirty):
@@ -723,11 +748,12 @@ class SessionJsonWriter:
         with self.lock, _session_file_lock(os.path.join(self.journal.directory, "readable-json.lock")):
             internal = self.journal.write(record)
             self._sync()
-            if record["stream_id"] not in self.documents:
+            document_stream = self.document_stream(record, record["stream_id"])
+            if document_stream not in self.documents:
                 self.path = internal
                 record["session_file"] = os.path.relpath(internal, self.directory)
                 return self.path
-            name = os.path.basename(internal)[:-1]
+            name = self.filename(document_stream)
             self.path = os.path.join(self.directory, name)
             record["session_file"] = name
             return self.path
@@ -1976,9 +2002,13 @@ def main(argv=None) -> int:
         ap.error("--tools-log 不能与 --log 使用同一个文件")
     sessions_dir = args.sessions_dir or os.path.dirname(os.path.abspath(args.log))
     journal_directory = os.path.normcase(os.path.abspath(sessions_dir))
+    title_path = os.path.normcase(os.path.abspath(os.path.join(sessions_dir,
+                                  SessionJsonWriter.filename(SessionJsonWriter.TITLE_STREAM))))
     for index_path in (args.log, tools_path):
         normalized = os.path.normcase(os.path.abspath(index_path))
         name = os.path.basename(normalized)
+        if normalized == title_path:
+            ap.error("审计/工具索引不能覆盖 auxiliary/titles.json 辅助正文")
         if (os.path.dirname(normalized) == journal_directory and
                 (name == "sessions-rl.jsonl" or re.fullmatch(r"session-.*-rl[.]jsonl?", name))):
             ap.error("审计/工具索引不能使用保留的 session-*-rl.json 正文文件名")

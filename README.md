@@ -76,7 +76,8 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 
 一键启动默认输出到脚本旁的 `audit-logs/<本次运行ID>/`。Windows 启动脚本默认输出到脚本目录的上一级。
 
-- `session-<分组ID>-rl.json`：真正的、格式化的 JSON 文档，直接打开或 `json.load()` 即可读，不需要重放补丁。
+- `session-<分组ID>-rl.json`：主对话的格式化 JSON，直接打开或 `json.load()` 即可读；同一分组逐轮追加。
+- `auxiliary/titles.json`：识别到的 OMP 自动标题请求统一追加到这一份辅助 JSON，不因重试、切换协议或标题上下文变化而在根目录新增文件；思考、输入和标题回复均保留，每轮含原始 `source_stream_id`。
 - `turns[].sse_complete`：是否捕获到 SSE 协议结束事件。客户端在结束事件后关闭连接仍记录 `client_disconnect`，但不再误标 `response_truncated_by`；此字段表示捕获完整，不保证客户端已收到每个字节。
 - `turns[].thinking`：该次响应中 API 实际返回的完整思考文本；没有返回时为 `null`，不会编造内容。
 - `turns[].tool_calls`：工具调用 ID、名称和完整 `arguments`；`turns[].tool_results`：工具名、参数、完整 `content` 及错误状态。
@@ -85,7 +86,7 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 
 每个稳定分组一份 JSON，每轮只追加新内容，已记录的请求历史和工具事件不反复写入。正常追加只替换文件结尾的数组/对象闭合符，保留此前轮次的字节，不整体覆盖累计文档。首次创建和中断修复使用临时文件原子替换。响应结束或中断后落盘，不是每个 token 立即写入；追加的短暂窗口内，外部读取者可能读到未闭合尾部，稍后重读即可。
 
-CRC32 只取 system 与首条 user 的实际内容，忽略内容块上的 `cache_control` 缓存元数据；缓存标记增加、移除或移动不会创建新分组，原始请求仍完整保留。OMP 自动生成标题等独立提示词请求使用自己的分组，因此一次 OMP 运行可能包含主对话 JSON 和标题 JSON。GET/HEAD/OPTIONS 等请求若不含对话、思考或工具事件（例如 `GET /usages` 额度查询），只保存在内部审计证据中，不再生成空会话 JSON。
+CRC32 只取 system 与首条 user 的实际内容，忽略内容块上的 `cache_control` 缓存元数据；缓存标记增加、移除或移动不会创建新分组，原始请求仍完整保留。已识别的 OMP 自动标题请求统一归入 `auxiliary/titles.json`，主目录只输出主对话分组；多个独立主对话仍各自保留文件。标题识别要求 system 匹配 OMP 标题模板，且不包含工具定义或工具事件；普通用户要求写标题不会被移出主对话。GET/HEAD/OPTIONS 等请求若不含对话、思考或工具事件（例如 `GET /usages` 额度查询），只保存在内部审计证据中，不再生成空会话 JSON。
 
 优先通过真实 response ID / previous_response_id 关联已有分组；无法关联时使用 system + 首条 user 的 CRC32，例如 `session-crc32-1a2b3c4d-rl.json`。已有响应链沿用原文件，无初始上下文时使用带 response ID 的文件名。每轮新 response ID 不会强制新建文件。SHA-256 校验锚点，防止 CRC32 碰撞误合并；相同初始上下文仍只是分组线索，不是独立运行/分支的严格身份。请求 ID 不冒充响应 ID。
 
@@ -108,7 +109,7 @@ for turn in document["turns"]:
 
 默认不生成 `audit.jsonl` / `tools.jsonl`。这两份是可选的交换/工具事件索引，包含状态、耗时、THINK 字符数及正文定位信息，不是思考或工具结果的正文。仅需直接阅读 JSON 时不必启用；排查问题可显式加 `--indexes`。`--raw-log` 额外保存全量调试日志，默认关闭，开启后会增加重复数据。
 
-`iter_session_records("/path/to/logs")` 可选地重建内部原始交换（包括请求/响应、解析后的 SSE 和 ChatML）；阅读普通 JSON 不需要它。旧版文件不会自动转换或删除。部署后正常重启才会使用新版；旧进程不会热更新。工具结果必须由客户端回传才能被代理记录，工具调用本身不代表执行成功。
+`iter_session_records("/path/to/logs")` 可选地重建内部原始交换（包括请求/响应、解析后的 SSE 和 ChatML）；阅读普通 JSON 不需要它。旧版文件（包括已生成在根目录的标题 JSON）不会自动转换或删除；新布局从新版采集开始使用。部署后正常重启才会使用新版；旧进程不会热更新。工具结果必须由客户端回传才能被代理记录，工具调用本身不代表执行成功。
 
 ```bash
 python omp_audit_proxy.py --help
@@ -209,7 +210,8 @@ Some provider shims advertise an OpenAI API while sending Anthropic requests. Au
 
 Launcher output defaults to `audit-logs/<run-id>/` beside the script. The Windows launcher defaults to the script directory's parent.
 
-- `session-<group-id>-rl.json` is real, formatted JSON. Open it directly or use `json.load()`; no patch replay is needed.
+- `session-<group-id>-rl.json` is directly readable, formatted JSON for a main-conversation group, appending new turns.
+- `auxiliary/titles.json` collects recognized OMP automatic-title requests in one incremental auxiliary document. Retries, protocol changes and updated title context do not create new root-level files. Thinking, inputs and title replies remain visible, with a `source_stream_id` on each turn.
 - `turns[].sse_complete` reports whether the SSE protocol terminal event was captured. A client disconnect after completion remains recorded, without a false `response_truncated_by` marker. This describes capture completeness, not guaranteed byte delivery to the client.
 - `turns[].thinking` contains the complete reasoning text actually exposed by that response; absent reasoning is `null` and is never invented.
 - `turns[].tool_calls` contains call IDs, tool names and complete `arguments`. `turns[].tool_results` contains names, arguments, full result `content` and error status.
@@ -218,7 +220,7 @@ Launcher output defaults to `audit-logs/<run-id>/` beside the script. The Window
 
 Each group has one JSON document. Only new content and unique tool events are appended. Normal appends replace the closing array/object footer and preserve earlier turn bytes; they do not rewrite the entire accumulated document. First creation and interrupted-write repair use atomic temporary-file replacement. Writes occur at response completion/interruption, not after each token. External readers may briefly observe an incomplete footer during append and should retry.
 
-CRC32 uses system and first-user content, ignoring `cache_control` metadata on content blocks. Adding, removing or moving cache hints does not create a new group; raw requests remain intact. Independent OMP prompts such as automatic title generation have their own groups, so one OMP run may produce a main-conversation JSON and a title JSON. GET/HEAD/OPTIONS requests without conversation content, reasoning or tool events (such as `GET /usages` quota checks) remain in internal evidence without generating empty conversation JSON files.
+CRC32 uses system and first-user content, ignoring `cache_control` metadata on content blocks. Adding, removing or moving cache hints does not create a new group; raw requests remain intact. Recognized automatic-title requests share `auxiliary/titles.json`; the root directory contains main-conversation groups. Independent main conversations still have separate files. Detection requires the OMP title-system template with no tool definitions or events; an ordinary user request to write a title stays in the main conversation. GET/HEAD/OPTIONS requests without conversation content, reasoning or tool events (such as `GET /usages` quota checks) remain in internal evidence without generating empty conversation JSON files.
 
 Known response IDs or previous_response_id link existing groups; otherwise the system and first user form a CRC32 anchor, e.g. `session-crc32-1a2b3c4d-rl.json`. Linked responses keep their original group file; without initial context the filename contains the response ID. A fresh response ID alone does not force a new file. SHA-256 disambiguates CRC32 collisions. Identical initial prompts remain grouping hints, not strict independent-session or branch identities. Request IDs are never treated as response IDs.
 
@@ -241,7 +243,7 @@ The internal evidence is persisted before the readable JSON. File locks serializ
 
 `audit.jsonl` and `tools.jsonl` are disabled by default. These optional exchange/tool indexes hold status, duration, THINK counts and payload locations, not the conversation body. They are unnecessary for reading the JSON; enable with `--indexes` for diagnostics. `--raw-log` enables additional full debugging dumps and therefore duplicates data; it is off by default.
 
-`iter_session_records("/path/to/logs")` optionally reconstructs original exchanges, including requests, responses, parsed SSE and ChatML. It is not needed to read public JSON. Legacy files are not automatically converted or deleted. Restart normally after deployment; running old processes do not hot-reload. Tool results must be returned by the client before they are visible to the proxy; a call alone does not prove success.
+`iter_session_records("/path/to/logs")` optionally reconstructs original exchanges, including requests, responses, parsed SSE and ChatML. It is not needed to read public JSON. Legacy files, including title JSON previously written in the root directory, are not automatically converted or deleted. New captures use the new layout. Restart normally after deployment; running old processes do not hot-reload. Tool results must be returned by the client before they are visible to the proxy; a call alone does not prove success.
 
 ```bash
 python -B -X utf8 test_audit_proxy.py

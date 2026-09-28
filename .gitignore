@@ -42,3 +42,5 @@ Thumbs.db
 .audit-state/
 session-*-rl.json.tmp
 failed-*.json
+auxiliary/titles.json
+auxiliary/titles.json.tmp
