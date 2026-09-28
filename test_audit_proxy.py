@@ -377,6 +377,55 @@ def launcher_regressions():
     return checks
 
 
+def shim_route_regressions():
+    seen = []
+    class EndpointProbe(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            seen.append(self.path)
+            valid = self.path in ("/gateway/v1/messages?beta=true", "/gateway/v1/chat/completions")
+            body = b'{"id":"response-fixture","choices":[]}' if valid else b'{"error":"wrong_path"}'
+            self.send_response(200 if valid else 404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    upstream = ap.AuditHTTPServer(("127.0.0.1", 0), EndpointProbe)
+    base = f"http://127.0.0.1:{upstream.server_port}/gateway/v1"
+    handler = type("ShimTestHandler", (ap.AuditHandler,), {
+        "routes": [ap.Route("/manual/", base, "openai-completions")],
+        "control_token": "synthetic-control-token", "logger": None, "tool_logger": None, "session_writer": None,
+    })
+    proxy = ap.AuditHTTPServer(("127.0.0.1", 0), handler)
+    for server in (upstream, proxy):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        status, registered = post(proxy.server_port, ap.CONTROL_PATH, {"routes": [{
+            "provider": "shim-fixture", "api": "openai-completions", "upstream": base}]},
+            headers={"Authorization": "Bearer synthetic-control-token"})
+        if status != 200:
+            raise RuntimeError("Unable to register fixture route")
+        route_path = json.loads(registered)["routes"][0]["baseUrl"].split(str(proxy.server_port), 1)[1]
+        body = {"messages": [{"role": "user", "content": "fixture"}]}
+        anthropic_status, _ = post(proxy.server_port, route_path + "/v1/messages?beta=true", body)
+        openai_status, _ = post(proxy.server_port, route_path + "/chat/completions", body)
+        manual_status, _ = post(proxy.server_port, "/manual/v1/messages?beta=true", body)
+        return [
+            ("shim_openai_catalog_anthropic_wire_avoids_duplicate_v1",
+             anthropic_status == 200 and seen[0] == "/gateway/v1/messages?beta=true"),
+            ("shim_same_route_retains_openai_v1_endpoint",
+             openai_status == 200 and seen[1] == "/gateway/v1/chat/completions"),
+            ("shim_does_not_rewrite_explicit_manual_routes",
+             manual_status == 404 and seen[2] == "/gateway/v1/v1/messages?beta=true"),
+        ]
+    finally:
+        for server in (proxy, upstream):
+            server.shutdown()
+            server.server_close()
+
+
 def session_archive_regressions(directory_parent=None):
     checks = []
     def record(exchange, response_id=None, first_user="first prompt"):
@@ -898,6 +947,7 @@ def main():
         and e.get("content") == "pong" for e in tool_lines)))
     results.extend(tool_regressions())
     results.extend(launcher_regressions())
+    results.extend(shim_route_regressions())
     results.extend(session_archive_regressions())
     results.extend(windows_launcher_regressions())
     if "--real-omp" in sys.argv:

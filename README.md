@@ -70,6 +70,8 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 
 一键启动会复用 OMP 的 Anthropic 地址规则：先移除基础地址末尾的 `/v1`，再转发客户端追加的 `/v1/messages`，避免重复拼接。Chat Completions 和 Responses 的 `/v1` 基础路径保持不变。
 
+部分 provider 会登记为 OpenAI、实际通过适配层发送 Anthropic 请求。因此自动路由还会按每次请求的实际协议检查基础路径，而不只依赖模型目录中的 API 类型。日志的 `routing` 字段记录目录类型、实际协议及路径是否调整；手动路由不受此规则影响。
+
 ### 日志与操作
 
 一键启动默认输出到脚本旁的 `audit-logs/<本次运行ID>/`，各次运行隔离；仅代理模式默认使用 `audit-logs/`：
@@ -174,6 +176,8 @@ Syntax: `--route /local-prefix/=upstream-base=protocol`. Repeat the option for m
 Explicit `--route` entries only replace the local prefix and do not deduplicate `/v1`; match your provider's actual request path when choosing the upstream base. Do not put credentials in route URLs.
 
 One-command launches mirror OMP's Anthropic URL normalization: remove a trailing `/v1` from the base before forwarding the client's `/v1/messages` suffix. Chat Completions and Responses retain their `/v1` base paths.
+
+Some provider shims advertise an OpenAI API while sending Anthropic requests. Automatic routes therefore check each request's wire protocol, not only the model catalog hint. The `routing` log field records the catalog API, wire API, and whether the base path changed. Explicit manual routes remain untouched.
 
 ### Logs and operation
 

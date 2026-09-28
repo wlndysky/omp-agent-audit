@@ -948,10 +948,11 @@ class SseTap:
 
 
 class Route:
-    def __init__(self, prefix: str, upstream: str, hint: str):
+    def __init__(self, prefix: str, upstream: str, hint: str, *, automatic: bool = False):
         self.prefix = prefix
         self.upstream = upstream.rstrip("/")
         self.hint = hint
+        self.automatic = automatic
         u = urllib.parse.urlsplit(self.upstream)
         self.scheme = u.scheme
         self.host = u.hostname
@@ -1112,7 +1113,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 providers.add(provider)
                 key = hashlib.sha256(_canon([provider, api, upstream]).encode()).hexdigest()[:20]
                 prefix = "/_audit/" + key + "/"
-                routes.append(Route(prefix, upstream, api))
+                routes.append(Route(prefix, upstream, api, automatic=True))
                 response.append({"provider": provider,
                                  "baseUrl": f"http://127.0.0.1:{self.server.server_port}" + prefix.rstrip("/")})
             with self.route_lock:
@@ -1171,13 +1172,21 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         # 上游路径 = 上游 base path + 去掉前缀的请求路径
         sub_path = raw_path[len(route.prefix):]
-        upstream_path = route.base_path + "/" + sub_path if not sub_path.startswith("/") else route.base_path + sub_path
+        base_path = route.base_path
+        # A provider shim may advertise OpenAI but send Anthropic messages.
+        # Normalize using the actual wire protocol, not only the catalog hint.
+        if route.automatic and protocol == "anthropic-messages" and base_path.endswith("/v1"):
+            base_path = base_path[:-3]
+        upstream_path = base_path + "/" + sub_path if not sub_path.startswith("/") else base_path + sub_path
         if not upstream_path.startswith("/"):
             upstream_path = "/" + upstream_path
 
         record.update({
             "route": route.prefix,
             "protocol": protocol,
+            "routing": {"mode": "automatic" if route.automatic else "explicit",
+                        "catalog_api": route.hint, "wire_api": protocol,
+                        "base_path_normalized": base_path != route.base_path},
             "method": self.command,
             "path": redact_query(raw_path),
             "upstream": f"{route.scheme}://{route.host}:{route.port}{(upstream_path if '?' not in upstream_path else upstream_path.split('?')[0])}",
