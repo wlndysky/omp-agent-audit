@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_audit_proxy.py — omp_audit_proxy 的本机 mock 验证。
+tests/run.py — omp_audit_proxy 的统一回归测试入口。
 不访问任何真实上游：mock 上游与本代理都跑在 127.0.0.1 临时端口。
 
 覆盖：普通 JSON、SSE、response-id 提取（anthropic/openai）、无 ID fallback hash
@@ -21,6 +21,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
+# Resolve the runtime module without depending on the caller's working directory.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import omp_audit_proxy as ap
 
 SECRET_HEADER = "SUPERSECRET-BEARER"

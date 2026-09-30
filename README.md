@@ -17,6 +17,19 @@ A local LLM API audit proxy for OMP built-in tools, MCP tools, and model context
 - 从请求历史恢复 OMP/MCP 工具名、参数和结果；重复历史会标记，无法确定的原始调用来源保留为空。
 - 不内置个人模型、上游地址、API Key 或 agent 配置。
 
+### 目录说明
+
+```text
+omp-agent-audit/
+├── omp_audit_proxy.py   # 审计代理和 OMP 启动器
+├── start-audit.cmd      # Windows 启动入口
+├── README.md           # 使用说明
+├── .gitignore          # 排除日志、凭据和缓存
+└── tests/              # 开发回归测试，统一入口 run.py
+```
+
+**日常使用只需要 `omp_audit_proxy.py`，Windows 可再保留 `start-audit.cmd`。** `tests/` 不参与审计运行，无需复制到部署目录；全部测试集中在该目录，根目录不再散放 `test_*.py`。
+
 ### 快速开始
 
 需要 Python 3.10+ 和已安装、可在命令行运行的 OMP。Python 无需第三方依赖。
@@ -68,8 +81,6 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 
 手动 `--route` 只替换前缀，不会自动去重上游路径中的 `/v1`。请按原 provider 的实际请求路径设置上游基础地址。不要把凭据放进路由 URL。
 
-一键启动会复用 OMP 的 Anthropic 地址规则：先移除基础地址末尾的 `/v1`，再转发客户端追加的 `/v1/messages`，避免重复拼接。Chat Completions 和 Responses 的 `/v1` 基础路径保持不变。
-
 部分 provider 会登记为 OpenAI、实际通过适配层发送 Anthropic 请求。一键启动在客户端完成协议适配后按 HTTP URL 路由，保留原始路径和查询参数，不重复增删 `/v1`。兼容旧扩展的自动路由仍按实际协议归一化路径；手动路由始终按配置原样转发。日志的 `routing` 字段记录目录类型、实际协议及路径是否调整。
 
 旧版本可能在后台刷新模型目录时，把 `http://127.0.0.1:<旧端口>/_audit/...` 缓存到 OMP 的 `models.db`，导致下次启动提示混合上游或旧审计地址。新版会指出受影响的 provider/model，并拒绝把旧代理地址当真实上游；不会猜测地址或修改用户配置。已受影响的缓存须先备份，再按可验证的原始上游修复。历史审计 JSON 无需处理。
@@ -115,9 +126,6 @@ for turn in document["turns"]:
 
 ```bash
 python omp_audit_proxy.py --help
-python -B -X utf8 test_audit_proxy.py
-python -B -X utf8 test_audit_proxy.py --real-omp
-python -B -X utf8 test_readable_json.py
 ```
 
 - `--sessions-dir` / `--output-dir`：可读 JSON 及内部状态的输出目录。
@@ -128,7 +136,18 @@ python -B -X utf8 test_readable_json.py
 - `--port`：一键模式自动选择空闲端口，仅代理模式默认 `8787`；`--upstream-connect-timeout` 默认 30 秒。
 - 正常按 OMP 自身方式退出，代理随后停止；一键模式的 `Ctrl+C` 保留 OMP 取消当前轮次的语义。
 
-测试使用本机合成数据；`--real-omp` 额外驱动已安装 OMP，使用临时独立配置和回环模拟上游，验证工具、路由、配置保留及可读 JSON，并验证 Kimi 刷新模型缓存后连续两次启动都保留原上游，不调用付费模型或真实 MCP。安装 Node.js 时还会运行临时扩展的 fetch 参数、路径边界和取消信号回归。JSON 测试覆盖思考全文、工具参数/结果、历史去重、追加字节保留、中断恢复和跨进程写入。
+### 开发与测试
+
+从仓库目录使用统一入口，无需逐个运行测试文件：
+
+```bash
+python -B -X utf8 tests/run.py
+python -B -X utf8 tests/run.py --real-omp
+```
+
+第一条运行本机模拟回归；第二条额外驱动已安装的 OMP，使用临时独立配置和回环模拟上游，不调用付费模型或真实 MCP。安装 Node.js 后会一并检查临时扩展及原生 fetch。
+
+覆盖会话隔离、增量追加、THINK 全文、重复工具调用与结果、历史去重、重启/中断恢复、并发写入、动态 provider 路由、重定向阻断、超时，以及 Kimi 模型缓存刷新。测试输出保存在临时目录，不作为使用示例或审计数据提交。
 
 ### 隐私与限制
 
@@ -156,6 +175,19 @@ python -B -X utf8 test_readable_json.py
 - Writes one directly readable `session-<group-id>-rl.json` per stable group, appending new turns with full thinking and tool payloads. The launcher isolates OMP session/agent identities. Untagged manual requests fall back to response ID / previous_response_id, then CRC32 of system and first user with SHA-256 collision checks. Request IDs are never used as response IDs.
 - Recovers OMP/MCP tool names, arguments, and results from request history, including after a proxy restart. Repeated context is marked; ambiguous origins are not guessed.
 - No personal models, upstream endpoints, API keys, or agent configuration are bundled.
+
+### Repository layout
+
+```text
+omp-agent-audit/
+├── omp_audit_proxy.py   # Audit proxy and OMP launcher
+├── start-audit.cmd      # Windows entry point
+├── README.md           # Usage guide
+├── .gitignore          # Exclude logs, credentials and caches
+└── tests/              # Development regressions; one entry point: run.py
+```
+
+**Normal use requires only `omp_audit_proxy.py`, plus the optional Windows `start-audit.cmd`.** The `tests/` directory is not used at runtime and does not need to be deployed. Test modules are kept together instead of scattered across the repository root.
 
 ### Quick start
 
@@ -208,8 +240,6 @@ Syntax: `--route /local-prefix/=upstream-base=protocol`. Repeat the option for m
 
 Explicit `--route` entries only replace the local prefix and do not deduplicate `/v1`; match your provider's actual request path when choosing the upstream base. Do not put credentials in route URLs.
 
-One-command launches mirror OMP's Anthropic URL normalization: remove a trailing `/v1` from the base before forwarding the client's `/v1/messages` suffix. Chat Completions and Responses retain their `/v1` base paths.
-
 Some provider shims advertise an OpenAI API while sending Anthropic requests. The launcher now routes the final HTTP URL after client protocol adaptation, preserving the exact path and query without adding or removing `/v1`. Compatibility routes for older extensions still normalize by wire protocol; explicit manual routes remain literal. The `routing` log field records the catalog API, wire API, and whether the base path changed.
 
 Older versions could allow background discovery to persist `http://127.0.0.1:<old-port>/_audit/...` in OMP's `models.db`. A subsequent launch can then report mixed endpoints or a stale audit URL. The new launcher identifies the affected provider/model and refuses to treat that URL as a real upstream. Back up affected caches and restore only verified original endpoints; the launcher does not guess endpoints or edit user configuration. Historical audit JSON needs no migration.
@@ -253,12 +283,6 @@ The internal evidence is persisted before the readable JSON. File locks serializ
 
 `iter_session_records("/path/to/logs")` optionally reconstructs original exchanges, including requests, responses, parsed SSE and ChatML. It is not needed to read public JSON. Legacy files, including title JSON previously written in the root directory, are not automatically converted or deleted. New captures use the new layout. Restart normally after deployment; running old processes do not hot-reload. Tool results must be returned by the client before they are visible to the proxy; a call alone does not prove success.
 
-```bash
-python -B -X utf8 test_audit_proxy.py
-python -B -X utf8 test_audit_proxy.py --real-omp
-python -B -X utf8 test_readable_json.py
-```
-
 - `--sessions-dir` / `--output-dir` select the public JSON and internal-state directory.
 - `--indexes` enables small indexes; `--log` / `--tools-log` choose their paths. For compatibility, `--log` alone supplies the default output parent directory without enabling indexes.
 - `--raw-log` explicitly enables full audit/tool debugging dumps. Off by default.
@@ -266,7 +290,18 @@ python -B -X utf8 test_readable_json.py
 - `--log-max-bytes` / `--log-backups` rotate only optional indexes (64 MiB / 5 backups by default). Public JSON and internal evidence are not automatically rotated.
 - `--port` is automatically selected in launcher mode and defaults to `8787` in proxy-only mode; upstream connect timeout defaults to 30 seconds.
 
-Tests use local synthetic fixtures. `--real-omp` additionally drives installed OMP against loopback mock upstreams with isolated temporary configuration, checking tools, routing, unchanged configuration and readable JSON, including two Kimi launches with discovery refreshes and clean cached endpoints. When Node.js is available, tests also exercise fetch arguments, endpoint boundaries and cancellation in the temporary extension. No paid models or real MCP services are invoked. JSON regressions cover full thinking, complete tool payloads, deduplication, preservation of earlier bytes, interrupted-write recovery and concurrent processes.
+### Development and tests
+
+Run the single entry point from the repository directory:
+
+```bash
+python -B -X utf8 tests/run.py
+python -B -X utf8 tests/run.py --real-omp
+```
+
+The first command runs local mock regressions. The second also drives an installed OMP against loopback mock upstreams with isolated temporary configuration. No paid models or real MCP services are invoked. Node.js enables the temporary-extension and native-fetch checks.
+
+Coverage includes session isolation, incremental appends, full API-exposed thinking, repeated tool calls and results, history deduplication, restart/crash recovery, concurrent writes, dynamic provider routing, redirect blocking, timeouts, and Kimi model-cache refreshes. Test output stays in temporary directories and is not committed as sample or audit data.
 
 ### Privacy and limitations
 
