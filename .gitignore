@@ -1,3 +1,9 @@
+# Keep local validation scripts out of the published repository.
+/tests/
+/test/
+test_*.py
+*_test.py
+
 # Runtime evidence must not be published.
 audit-logs/
 logs/

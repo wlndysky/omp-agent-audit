@@ -24,11 +24,10 @@ omp-agent-audit/
 ├── omp_audit_proxy.py   # 审计代理和 OMP 启动器
 ├── start-audit.cmd      # Windows 启动入口
 ├── README.md           # 使用说明
-├── .gitignore          # 排除日志、凭据和缓存
-└── tests/              # 开发回归测试，统一入口 run.py
+└── .gitignore          # 排除本地文件、日志、凭据和缓存
 ```
 
-**日常使用只需要 `omp_audit_proxy.py`，Windows 可再保留 `start-audit.cmd`。** `tests/` 不参与审计运行，无需复制到部署目录；全部测试集中在该目录，根目录不再散放 `test_*.py`。
+**日常使用只需要 `omp_audit_proxy.py`，Windows 可再保留 `start-audit.cmd`。** 仓库仅发布运行脚本和使用说明。
 
 ### 快速开始
 
@@ -136,19 +135,6 @@ python omp_audit_proxy.py --help
 - `--port`：一键模式自动选择空闲端口，仅代理模式默认 `8787`；`--upstream-connect-timeout` 默认 30 秒。
 - 正常按 OMP 自身方式退出，代理随后停止；一键模式的 `Ctrl+C` 保留 OMP 取消当前轮次的语义。
 
-### 开发与测试
-
-从仓库目录使用统一入口，无需逐个运行测试文件：
-
-```bash
-python -B -X utf8 tests/run.py
-python -B -X utf8 tests/run.py --real-omp
-```
-
-第一条运行本机模拟回归；第二条额外驱动已安装的 OMP，使用临时独立配置和回环模拟上游，不调用付费模型或真实 MCP。安装 Node.js 后会一并检查临时扩展及原生 fetch。
-
-覆盖会话隔离、增量追加、THINK 全文、重复工具调用与结果、历史去重、重启/中断恢复、并发写入、动态 provider 路由、重定向阻断、超时，以及 Kimi 模型缓存刷新。测试输出保存在临时目录，不作为使用示例或审计数据提交。
-
 ### 隐私与限制
 
 - 自动路由覆盖上述三类 API。启动时预登记统一端点的 provider；运行中切换 provider、API 或上游端点时，在下一轮请求前按当前模型动态登记。混合端点 provider 可按实际选中模型接入；不支持的 API、旧审计地址或登记失败会停止此次 OMP，避免漏审计直连。
@@ -183,11 +169,10 @@ omp-agent-audit/
 ├── omp_audit_proxy.py   # Audit proxy and OMP launcher
 ├── start-audit.cmd      # Windows entry point
 ├── README.md           # Usage guide
-├── .gitignore          # Exclude logs, credentials and caches
-└── tests/              # Development regressions; one entry point: run.py
+└── .gitignore          # Exclude local files, logs, credentials and caches
 ```
 
-**Normal use requires only `omp_audit_proxy.py`, plus the optional Windows `start-audit.cmd`.** The `tests/` directory is not used at runtime and does not need to be deployed. Test modules are kept together instead of scattered across the repository root.
+**Normal use requires only `omp_audit_proxy.py`, plus the optional Windows `start-audit.cmd`.** The repository distributes the runtime scripts and usage guide.
 
 ### Quick start
 
@@ -289,19 +274,6 @@ The internal evidence is persisted before the readable JSON. File locks serializ
 - On export failure, an enabled audit index retains the failed full record with `session_export_error`; without indexes, `failed-<exchange_id>.json` preserves it and an error is reported.
 - `--log-max-bytes` / `--log-backups` rotate only optional indexes (64 MiB / 5 backups by default). Public JSON and internal evidence are not automatically rotated.
 - `--port` is automatically selected in launcher mode and defaults to `8787` in proxy-only mode; upstream connect timeout defaults to 30 seconds.
-
-### Development and tests
-
-Run the single entry point from the repository directory:
-
-```bash
-python -B -X utf8 tests/run.py
-python -B -X utf8 tests/run.py --real-omp
-```
-
-The first command runs local mock regressions. The second also drives an installed OMP against loopback mock upstreams with isolated temporary configuration. No paid models or real MCP services are invoked. Node.js enables the temporary-extension and native-fetch checks.
-
-Coverage includes session isolation, incremental appends, full API-exposed thinking, repeated tool calls and results, history deduplication, restart/crash recovery, concurrent writes, dynamic provider routing, redirect blocking, timeouts, and Kimi model-cache refreshes. Test output stays in temporary directories and is not committed as sample or audit data.
 
 ### Privacy and limitations
 
