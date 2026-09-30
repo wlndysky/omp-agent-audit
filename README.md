@@ -8,6 +8,14 @@ A local LLM API audit proxy for OMP built-in tools, MCP tools, and model context
 
 ## 中文
 
+### 正式测试结果
+
+**2026-09-30 已通过两份真实 OMP 会话的正式对照测试：本次核对范围内，对话正文、API 返回的思考（THINK）、工具调用参数及工具返回正文无丢失。**
+
+逐条对照 OMP 原始会话日志与审计 JSON，共核验 72 轮模型回复、55 个思考块、70 次工具调用及 70 份工具结果。响应 ID 和顺序、正文、思考全文、工具参数、返回正文、停止原因及 token 用量均匹配，无重复响应。测试脚本和原始会话日志不随仓库发布。
+
+此结论限定于上述实测会话的内容核对，不代表完整复制 OMP 内部日志。可读 JSON 尚未保留 model/provider、工具 details 中的结构化退出码及执行起止时间；本次 5 次工具错误的报错正文均完整保留，但 `is_error` 为 `null`。其他运行边界见下文“隐私与限制”。
+
 ### 功能
 
 - 单文件 Python，纯标准库，仅监听 `127.0.0.1`。
@@ -152,6 +160,14 @@ python omp_audit_proxy.py --help
 - 正文和 SSE 事件日志有截断阈值；检查截断、断连标记，不应视为无限量、不可丢失的归档。
 
 ## English
+
+### Formal validation results
+
+**On 2026-09-30, formal comparison against two real OMP sessions passed: no loss of conversation text, API-exposed reasoning (THINK), tool arguments, or tool-result text was found within the checked scope.**
+
+The audit JSON was compared entry by entry with the original OMP session logs: 72 model replies, 55 reasoning blocks, 70 tool calls, and 70 tool results. Response IDs and order, reply text, full reasoning, tool arguments, result text, stop reasons, and token usage matched, with no duplicate responses. Test scripts and original session logs are not published with the repository.
+
+This conclusion applies to the content comparison of these sessions, not a complete copy of OMP's internal logs. Readable JSON does not yet retain model/provider, structured exit codes from tool details, or tool execution start/end times. All five tool errors retained their full error text, but `is_error` was `null`. See “Privacy and limitations” below for other operating boundaries.
 
 ### Features
 
