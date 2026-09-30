@@ -238,6 +238,19 @@ def tool_regressions():
     checks.append(("identical_concurrent_calls_keep_origin_ambiguous", same_signature["call_exchange_id"] is None
                    and same_signature["correlated"] and same_signature["arguments"] == b["arguments"]))
 
+    repeated = ap.ToolTraceTracker()
+    repeated.observe_calls("repeat-call-1", [a], "repeat-scope", "repeat-response-1")
+    same_result = {"tool_call_id": "same", "content": "identical", "source": "request.messages[2]"}
+    repeated.observe_results("repeat-result-1", [same_result], "repeat-scope")
+    repeated.observe_calls("repeat-call-2", [a], "repeat-scope", "repeat-response-2")
+    second_result = repeated.observe_results("repeat-result-2", [same_result], "repeat-scope")[0]
+    checks.append(("repeated_identical_call_result_is_not_asserted_replay",
+                   second_result["replayed_context"] is not True and second_result["result_origin_ambiguous"]))
+    duplicate_calls = ap.ToolTraceTracker()
+    duplicate_calls.observe_calls("same-response", [a, a], "repeat-scope")
+    checks.append(("duplicate_ids_within_response_remain_distinct_cached_calls",
+                   len(duplicate_calls._calls) == 2))
+
     cold_tracker = ap.ToolTraceTracker()
     future = cold_tracker.observe_results("H", [result], "route", [{**b, "position": 2}])[0]
     checks.append(("future_context_call_does_not_match_past_result", not future["correlated"]))
@@ -805,11 +818,35 @@ def real_omp_smoke(api="openai-completions", *, discovered=False):
                     "id": "other", "baseUrl": f"http://127.0.0.1:{mock.server_port}/different/v1"})
                 with open(models_path, "w", encoding="utf-8") as fh:
                     json.dump(configuration, fh)
+                mixed = subprocess.run(command, env=environment, cwd=workspace, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=55,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                all_archives = list(ap.iter_session_records(os.path.join(directory, "logs")))
+                after_mixed_run = len(requests)
+                configuration["providers"][provider_id]["api"] = "google-generative-ai"
+                configuration["providers"][provider_id]["models"] = [configuration["providers"][provider_id]["models"][0]]
+                with open(models_path, "w", encoding="utf-8") as fh:
+                    json.dump(configuration, fh)
                 failed = subprocess.run(command, env=environment, cwd=workspace, capture_output=True, text=True,
                     encoding="utf-8", errors="replace", timeout=55,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-                checks.append(("real_omp_unsafe_routing_stops_before_inference", failed.returncode != 0
-                               and len(requests) == before_failed_run and "cannot be safely auto-routed" in failed.stderr))
+                checks.extend([
+                    ("real_omp_mixed_provider_routes_selected_model", mixed.returncode == 0
+                     and "AUDIT_LOCAL_OK" in mixed.stdout and after_mixed_run == before_failed_run + 2),
+                    ("real_omp_mixed_provider_uses_exact_upstream_paths", len(request_paths) == 4
+                     and all(path.split("?", 1)[0] == expected_path for path in request_paths)),
+                    ("real_omp_unsafe_routing_stops_before_inference", failed.returncode != 0
+                     and len(requests) == after_mixed_run and "Unsupported or missing endpoint" in failed.stderr),
+                ])
+            audited_model_requests = [record for record in all_archives if record.get("method") == "POST"]
+            checks.extend([
+                ("real_omp_independent_identical_prompts_have_distinct_sessions", len(audited_model_requests) == 4
+                 and len({record.get("audit_session_id") for record in audited_model_requests}) == 2
+                 and all(record.get("audit_session_id") and record.get("audit_agent_id")
+                         for record in audited_model_requests)
+                 and len({record.get("stream_id") for record in audited_model_requests}) == 2),
+                ("real_omp_private_identity_never_reaches_upstream", all("_omp_audit_v1" not in body for body in requests)),
+            ])
             if discovered:
                 return [(name.replace("real_omp_", "real_omp_kimi_"), ok) for name, ok in checks]
             return [(name.replace("real_omp_", "real_omp_anthropic_") if is_anthropic else name, ok)
@@ -1080,6 +1117,14 @@ def main():
     results.extend(tool_regressions())
     results.extend(launcher_regressions())
     results.extend(launcher_fetch_regressions())
+    from test_launcher_extension import run_checks as launcher_extension_checks
+    results.extend(launcher_extension_checks())
+    from test_proxy_timeouts import run_checks as proxy_timeout_checks
+    results.extend(proxy_timeout_checks())
+    from test_tool_occurrences import run_checks as tool_occurrence_checks
+    results.extend(tool_occurrence_checks())
+    from test_proxy_redirects import run_checks as proxy_redirect_checks
+    results.extend(proxy_redirect_checks())
     results.extend(shim_route_regressions())
     results.extend(session_archive_regressions())
     results.extend(windows_launcher_regressions())

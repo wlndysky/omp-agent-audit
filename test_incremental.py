@@ -110,6 +110,74 @@ def run_checks(directory_parent=None):
             collisions.write(c2)
         checks.append(("journal_crc32_collision_keeps_distinct_sha256_anchors", c1["stream_id"] != c2["stream_id"]))
 
+        agents = ap.DeltaJournalWriter(str(root / "agent-identities"))
+        agent_records = []
+        for i, agent_id in enumerate(("agent-a", "agent-b", "agent-a")):
+            item = fixture("agent-" + str(i), "same-response", "same prompt")
+            item.update(audit_session_id="shared-session", audit_agent_id=agent_id)
+            agents.write(item)
+            agent_records.append(item)
+        checks.append(("journal_same_session_different_agents_are_isolated",
+                       agent_records[0]["stream_id"] != agent_records[1]["stream_id"]
+                       and agent_records[0]["stream_id"] == agent_records[2]["stream_id"]))
+
+        identified_dir = root / "identified-sessions"
+        identified = ap.DeltaJournalWriter(str(identified_dir))
+        session_a, session_b = fixture("session-a-first", "shared-response"), fixture("session-b-first", "shared-response")
+        session_a["audit_session_id"] = "fixture-session-a"
+        session_b["audit_session_id"] = "fixture-session-b"
+        session_a_path = Path(identified.write(session_a))
+        session_b_path = Path(identified.write(session_b))
+        session_a_bytes = session_a_path.read_bytes()
+        checks.append(("journal_explicit_sessions_isolate_identical_prompts_and_response_ids",
+                       session_a_path != session_b_path
+                       and list(ap.iter_session_records(session_a_path)) == [session_a]
+                       and list(ap.iter_session_records(session_b_path)) == [session_b]))
+
+        identified = ap.DeltaJournalWriter(str(identified_dir))
+        session_a_next = fixture("session-a-next", "new-response", "changed input after context reset")
+        session_a_next["audit_session_id"] = "fixture-session-a"
+        checks.append(("journal_explicit_session_restart_keeps_file_when_context_changes",
+                       Path(identified.write(session_a_next)) == session_a_path
+                       and session_a_path.read_bytes().startswith(session_a_bytes)))
+
+        anonymous = fixture("anonymous", "shared-response")
+        anonymous_path = Path(identified.write(anonymous))
+        checks.append(("journal_missing_session_cannot_attach_to_explicit_response_or_context",
+                       anonymous_path not in (session_a_path, session_b_path)))
+
+        other_provider = fixture("anonymous-other-provider", "other-response")
+        other_provider["upstream"] = "https://different.example/v1"
+        other_provider_path = Path(identified.write(other_provider))
+        checks.append(("journal_same_fallback_context_is_provider_scoped",
+                       other_provider_path != anonymous_path
+                       and list(ap.iter_session_records(anonymous_path)) == [anonymous]))
+
+        session_a_provider = fixture("session-a-other-provider", "shared-response")
+        session_a_provider["audit_session_id"] = "fixture-session-a"
+        session_a_provider["upstream"] = "https://different.example/v1"
+        session_a_provider_path = Path(identified.write(session_a_provider))
+        session_a_protocol = fixture("session-a-other-protocol", "shared-response")
+        session_a_protocol["audit_session_id"] = "fixture-session-a"
+        session_a_protocol["protocol"] = "openai-responses"
+        session_a_protocol["request"]["body"] = {"instructions": "fixture system", "input": "first"}
+        session_a_protocol["chatml"]["messages"] = [
+            *ap.derive_chatml_request("openai-responses", session_a_protocol["request"]["body"]),
+            {"role": "assistant", "content": "answer", "thinking": "visible reasoning"}]
+        session_a_protocol_path = Path(identified.write(session_a_protocol))
+        checks.append(("journal_explicit_session_is_scoped_by_upstream_and_protocol",
+                       len({session_a_path, session_a_provider_path, session_a_protocol_path}) == 3
+                       and session_a_provider_path != other_provider_path))
+
+        identified_rows = [session_a, session_b, session_a_next, anonymous, other_provider,
+                           session_a_provider, session_a_protocol]
+        before_reexport = {path.name: path.read_bytes() for path in identified_dir.glob("*.jsonl")}
+        ap.DeltaJournalWriter(str(identified_dir)).write(copy.deepcopy(session_a_next))
+        checks.append(("journal_identified_session_replay_is_lossless_and_reexport_idempotent",
+                       list(ap.iter_session_records(identified_dir)) == identified_rows
+                       and before_reexport == {path.name: path.read_bytes()
+                                               for path in identified_dir.glob("*.jsonl")}))
+
         damaged = root / "damaged"
         damaged.mkdir()
         damaged_path = damaged / path.name

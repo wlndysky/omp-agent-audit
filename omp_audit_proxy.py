@@ -3,8 +3,8 @@
 omp_audit_proxy.py — 本地（127.0.0.1-only）LLM API 流式审计反向代理，单文件，纯标准库。
 
 用途：作为 OMP（或任何 OpenAI/Anthropic 兼容客户端）与真实上游之间的透明中转，
-把新对话、完整 thinking、工具参数/结果增量追加到可直接读取的 JSON；优先关联真实 response ID，
-无法关联时用 system+首条 user 的 CRC32 分组，SHA-256 防止 CRC32 碰撞误合并。
+把新对话、完整 thinking、工具参数/结果增量追加到可直接读取的 JSON；一键模式按 OMP session/agent 隔离，
+无可信身份时关联真实 response ID，最后按 system+首条 user 的 CRC32 分组并用 SHA-256 校验。
 
 它能看到什么（边界声明）：
   - 经过本代理的 HTTP 请求体、响应头、解析后的 SSE 事件。
@@ -20,7 +20,7 @@ omp_audit_proxy.py — 本地（127.0.0.1-only）LLM API 流式审计反向代�
   - openai-completions:  POST {baseUrl}/chat/completions
   - openai-responses:    POST {baseUrl}/responses
 
-输出：session-<稳定分组ID>-rl.json，每个主对话响应链或 CRC32 组只追加新轮次。
+输出：session-<稳定分组ID>-rl.json，每个会话身份、响应链或 CRC32 组只追加新轮次。
 OMP 自动标题统一增量追加到 auxiliary/titles.json，避免辅助请求堆积在主目录。
 .audit-state 保存内部增量恢复证据；audit.jsonl 和 tools.jsonl 索引默认不生成。
 工具结果包含工具名、参数、返回内容、调用/结果 exchange ID、来源与重复历史标记。
@@ -90,26 +90,101 @@ SUPPORTED_APIS = {"anthropic-messages", "openai-completions", "openai-responses"
 # Redirect fetch at the HTTP boundary. Never put ephemeral URLs into OMP's
 # registry: background discovery can persist those URLs into models.db.
 LAUNCHER_EXTENSION = r'''
+import { createHmac } from "node:crypto";
+
 export default function (pi) {
   const root = process.env.OMP_AUDIT_CONTROL_URL;
   const token = process.env.OMP_AUDIT_CONTROL_TOKEN;
   const supported = new Set(["anthropic-messages", "openai-completions", "openai-responses"]);
-  const originalFetch = globalThis.fetch;
-  let destinations = [];
-  globalThis.fetch = new Proxy(originalFetch, {
-    apply(target, receiver, args) {
-      const [input, init] = args;
-      const url = new URL(input instanceof Request ? input.url : String(input));
-      const route = destinations.find(r => url.origin === r.origin &&
-        (url.pathname === r.path || url.pathname.startsWith(r.path + "/")));
-      if (!route) return Reflect.apply(target, receiver, args);
-      // Keep the entire original path suffix (including its leading slash).
-      // Do not rebuild headers/options: this preserves auth, abort and streams.
-      const local = route.local + "/" + url.pathname.slice(route.path.length) + url.search;
-      const forwarded = input instanceof Request ? new Request(local, input) : local;
-      return Reflect.apply(target, receiver, [forwarded, init]);
-    },
+  const key = Symbol.for("omp.audit.launcher.routing.v1");
+  const state = globalThis[key] || (globalThis[key] = {
+    originalFetch: globalThis.fetch,
+    destinations: new Map(),
+    pending: new Map(),
   });
+  function fail(error) {
+    process.stderr.write("[audit] routing failed; stopping this OMP session: " + String(error) + "\n");
+    process.exit(1);
+    throw error;
+  }
+  function routeKey(entry) {
+    return JSON.stringify([entry.provider, entry.api, entry.upstream]);
+  }
+  function endpoint(model) {
+    if (!model || !supported.has(model.api) || typeof model.baseUrl !== "string" || !model.baseUrl.trim()) {
+      fail("Unsupported or missing endpoint for selected model " +
+        (model ? model.provider + "/" + model.id + " (" + model.api + ")" : "<none>"));
+    }
+    if (/^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+\/_audit\//.test(model.baseUrl)) {
+      fail("Stale audit URL for " + model.provider + "/" + model.id);
+    }
+    return {provider: model.provider, api: model.api,
+      upstream: model.baseUrl.trim().replace(/\/+$/, ""), exact_path: true};
+  }
+  async function register(entries) {
+    const response = await state.originalFetch(root + "/__audit/routes", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "Authorization": "Bearer " + token},
+      body: JSON.stringify({routes: entries}),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) throw new Error("Audit route registration failed: " + response.status);
+    const payload = await response.json();
+    if (!Array.isArray(payload.routes) || payload.routes.length !== entries.length) {
+      throw new Error("Incomplete audit route registration");
+    }
+    for (const route of payload.routes) {
+      const entry = entries.find(e => e.provider === route.provider);
+      if (!entry) throw new Error("Unexpected audit route registration");
+      const upstream = new URL(entry.upstream);
+      state.destinations.set(routeKey(entry), {
+        origin: upstream.origin,
+        path: upstream.pathname.replace(/\/+$/, ""),
+        local: route.baseUrl,
+      });
+    }
+  }
+  async function ensureModel(model) {
+    const entry = endpoint(model);
+    const id = routeKey(entry);
+    if (state.destinations.has(id)) return;
+    let pending = state.pending.get(id);
+    if (!pending) {
+      pending = register([entry]);
+      state.pending.set(id, pending);
+    }
+    try {
+      await pending;
+    } catch (error) {
+      fail(error);
+    } finally {
+      state.pending.delete(id);
+    }
+  }
+  if (!state.proxyFetch) {
+    state.proxyFetch = new Proxy(state.originalFetch, {
+      apply(target, receiver, args) {
+        const [input, init] = args;
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        const method = String(init?.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
+        const routes = [...state.destinations.values()].sort((a, b) => b.path.length - a.path.length);
+        const route = routes.find(r => url.origin === r.origin &&
+          (url.pathname === r.path || url.pathname.startsWith(r.path + "/")));
+        if (!route) {
+          // The hook can fail or be absent for a provider. Never send a model
+          // inference request directly to an unregistered HTTP endpoint.
+          if (method === "POST" && /\/(?:v1\/)?(?:messages|chat\/completions|responses)\/*$/.test(url.pathname)) {
+            throw new Error("Uncovered model request blocked by audit launcher: " + url.origin + url.pathname);
+          }
+          return Reflect.apply(target, receiver, args);
+        }
+        const local = route.local + "/" + url.pathname.slice(route.path.length) + url.search;
+        const forwarded = input instanceof Request ? new Request(local, input) : local;
+        return Reflect.apply(target, receiver, [forwarded, init]);
+      },
+    });
+    globalThis.fetch = state.proxyFetch;
+  }
   pi.on("session_start", async (_event, ctx) => {
     try {
       if (!root || !token) throw new Error("Missing private launcher connection");
@@ -120,7 +195,6 @@ export default function (pi) {
         grouped.set(model.provider, group);
       }
       const entries = [];
-      const reasons = new Map();
       let skipped = 0;
       for (const [provider, models] of grouped) {
         const endpoints = new Set(models.map(m => JSON.stringify([m.api, m.baseUrl])));
@@ -128,51 +202,57 @@ export default function (pi) {
         const stale = models.some(m => /^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d+\/_audit\//.test(m.baseUrl || ""));
         if (stale) {
           skipped++;
-          reasons.set(provider, "stale audit URL in model cache; restore the verified original endpoint");
           continue;
         }
         if (endpoints.size !== 1 || !supported.has(model.api) || !model.baseUrl) {
           skipped++;
-          reasons.set(provider, endpoints.size !== 1 ? "mixed model endpoints/APIs" :
-            !model.baseUrl ? "missing base URL" : "unsupported API " + model.api);
           continue;
         }
-        entries.push({provider, api: model.api, upstream: model.baseUrl, exact_path: true});
+        entries.push(endpoint(model));
       }
-      if (ctx.model && !entries.some(r => r.provider === ctx.model.provider)) {
-        throw new Error("The selected provider cannot be safely auto-routed: " +
-          ctx.model.provider + "/" + ctx.model.id + " (" +
-          (reasons.get(ctx.model.provider) || "model absent from catalog") + ")");
-      }
-      const response = await originalFetch(root + "/__audit/routes", {
-        method: "POST",
-        headers: {"Content-Type": "application/json", "Authorization": "Bearer " + token},
-        body: JSON.stringify({routes: entries}),
-        signal: AbortSignal.timeout(15000),
-      });
-      if (!response.ok) throw new Error("Audit route registration failed: " + response.status);
-      const payload = await response.json();
-      destinations = payload.routes.map(route => {
-        const entry = entries.find(e => e.provider === route.provider);
-        if (!entry) throw new Error("Unexpected audit route registration");
-        const upstream = new URL(entry.upstream);
-        return {origin: upstream.origin, path: upstream.pathname.replace(/\/+$/, ""), local: route.baseUrl};
-      }).sort((a, b) => b.path.length - a.path.length);
-      if (destinations.length !== entries.length) throw new Error("Incomplete audit route registration");
-      const ready = await originalFetch(root + "/__audit/routes", {
+      if (ctx.model) endpoint(ctx.model);
+      await register(entries);
+      if (ctx.model) await ensureModel(ctx.model);
+      const ready = await state.originalFetch(root + "/__audit/routes", {
         method: "POST",
         headers: {"Content-Type": "application/json", "Authorization": "Bearer " + token},
         body: JSON.stringify({routes: [], ready: true}),
         signal: AbortSignal.timeout(15000),
       });
       if (!ready.ok) throw new Error("Audit readiness acknowledgement failed");
-      process.stderr.write("[audit] temporary routing ready: " + payload.routes.length +
-        " provider(s); " + skipped + " unsupported/mixed provider(s) unchanged.\n");
+      process.stderr.write("[audit] temporary routing ready: " + entries.length +
+        " provider(s); " + skipped + " provider(s) deferred to selected-model validation.\n");
     } catch (error) {
-      process.stderr.write("[audit] startup failed; stopping this OMP session: " + String(error) + "\n");
-      ctx.shutdown();
-      // Print-mode shutdown hooks can be no-ops. Do not continue un-audited.
-      process.exit(1);
+      fail(error);
+    }
+  });
+  // Some providers have their own transport and do not emit the payload hook.
+  // Validate before every turn as well as before each supported HTTP request.
+  pi.on("context", async (_event, ctx) => {
+    try {
+      await ensureModel(ctx.model);
+    } catch (error) {
+      fail(error);
+    }
+  });
+  pi.on("before_provider_request", async (event, ctx) => {
+    try {
+      if (!root || !token) fail("Missing private launcher connection");
+      await ensureModel(ctx.model);
+      if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) {
+        fail("Cannot tag a non-object provider payload");
+      }
+      const sessionId = ctx.sessionManager.getSessionId();
+      const agentId = ctx.agent.id;
+      if ([sessionId, agentId].some(value => typeof value !== "string" || !value.length ||
+          value.length > 512 || value.includes("\0"))) {
+        fail("Missing or invalid session identity");
+      }
+      const signature = createHmac("sha256", token)
+        .update(sessionId + "\0" + agentId).digest("hex");
+      return {...event.payload, _omp_audit_v1: {session_id: sessionId, agent_id: agentId, signature}};
+    } catch (error) {
+      fail(error);
     }
   });
 }
@@ -459,7 +539,7 @@ def iter_session_records(path):
 
 
 class DeltaJournalWriter:
-    """One named append-only journal per stable response chain or CRC32 group."""
+    """One append-only journal per session identity, response chain or CRC32 group."""
 
     def __init__(self, directory: str):
         self.directory = os.path.abspath(directory)
@@ -481,16 +561,20 @@ class DeltaJournalWriter:
         self.heads[stream] = frame["exchange_id"]
         self.seen[frame["exchange_id"]] = path
         self.sequence = frame["sequence"]
-        if frame.get("response_id"):
+        # A request without a session identity must never attach to an explicitly
+        # identified session just because the provider reused a response ID.
+        explicit_session = state.get("audit_session_id")
+        if frame.get("response_id") and not explicit_session:
             self.responses[(frame["scope"], frame["response_id"])] = stream
-        if frame.get("context_sha256"):
-            self.contexts[(frame["context_crc32"], frame["context_sha256"])] = stream
+        if frame.get("context_sha256") and not explicit_session:
+            self.contexts[(frame["scope"], frame["context_crc32"], frame["context_sha256"])] = stream
             # Older journals included transient cache hints in their identity.
             # Restore a normalized alias without renaming or rewriting evidence.
             anchor = initial_context(state["protocol"], state["request"].get("body"))
             if anchor is not None:
                 encoded = _canon(anchor).encode("utf-8")
-                normalized = (f"{zlib.crc32(encoded):08x}", hashlib.sha256(encoded).hexdigest())
+                normalized = (frame["scope"], f"{zlib.crc32(encoded):08x}",
+                              hashlib.sha256(encoded).hexdigest())
                 self.contexts.setdefault(normalized, stream)
         self.frames += 1
 
@@ -518,28 +602,40 @@ class DeltaJournalWriter:
         response_id = grouping["primary_id"]
         previous_id = body.get("previous_response_id") if isinstance(body, dict) else None
         scope = str(record.get("upstream", "")) + "|" + record["protocol"]
+        session_id = record.get("audit_session_id")
+        agent_id = record.get("audit_agent_id")
+        if session_id is not None and (not isinstance(session_id, str) or not session_id):
+            raise ValueError("audit_session_id must be a nonempty string")
+        if agent_id is not None and (not isinstance(agent_id, str) or not agent_id):
+            raise ValueError("audit_agent_id must be a nonempty string")
         lock_path = os.path.join(self.directory, ".session-locks", "sessions-rl.lock")
         with self.lock, _session_file_lock(lock_path):
             self._sync()
             if record["exchange_id"] in self.seen:
                 self.path = self.seen[record["exchange_id"]]
                 return self.path
-            stream = self.responses.get((scope, response_id)) if response_id else None
-            reason = "response_id" if stream else None
-            if not stream and previous_id:
-                stream = self.responses.get((scope, previous_id))
-                if stream:
-                    reason = "previous_response_id"
-            if not stream and crc:
-                stream = self.contexts.get((crc, fingerprint))
+            if session_id:
+                identity = [scope, session_id] + ([agent_id] if agent_id else [])
+                digest = hashlib.sha256(_canon(identity).encode("utf-8")).hexdigest()
+                stream, reason = "audit-session-" + digest[:32], "audit_session_id"
+            else:
+                stream = self.responses.get((scope, response_id)) if response_id else None
+                reason = "response_id" if stream else None
+                if not stream and previous_id:
+                    stream = self.responses.get((scope, previous_id))
+                    if stream:
+                        reason = "previous_response_id"
+                if not stream and crc:
+                    stream = self.contexts.get((scope, crc, fingerprint))
+                    if not stream:
+                        collision = any(key[1] == crc for key in self.contexts)
+                        suffix = hashlib.sha256(_canon([scope, fingerprint]).encode()).hexdigest()[:16]
+                        stream = "crc32:" + crc + ("-" + suffix if collision else "")
+                    reason = "system+first_user.crc32"
                 if not stream:
-                    collision = any(key[0] == crc and key[1] != fingerprint for key in self.contexts)
-                    stream = "crc32:" + crc + ("-" + fingerprint[:16] if collision else "")
-                reason = "system+first_user.crc32"
-            if not stream:
-                stream = ("response:" + response_id + "@" + hashlib.sha256(scope.encode()).hexdigest()[:12]
-                          if response_id else "unclassified:" + record["exchange_id"])
-                reason = "response_id" if response_id else "unclassified"
+                    stream = ("response:" + response_id + "@" + hashlib.sha256(scope.encode()).hexdigest()[:12]
+                              if response_id else "unclassified:" + record["exchange_id"])
+                    reason = "response_id" if response_id else "unclassified"
             record["session_file"] = session_filename(stream)
             self.path = os.path.join(self.directory, record["session_file"])
             record["stream_id"] = stream
@@ -602,6 +698,7 @@ class SessionJsonWriter:
         self.lock = threading.Lock()
         self.offsets, self.raw_states, self.heads = {}, {}, {}
         self.documents, self.messages_seen, self.calls_seen, self.results_seen = {}, {}, {}, {}
+        self.tool_counts, self.delta_tool_seen = {}, {}
         self.dirty = set()
         self.path = None
 
@@ -625,6 +722,107 @@ class SessionJsonWriter:
             return SessionJsonWriter.TITLE_STREAM
         return stream
 
+    def _tool_events(self, record, assistant, stream):
+        """Deduplicate echoed history, never distinct response occurrences."""
+        counts = self.tool_counts.setdefault(stream, {"calls": {}, "results": {}, "results_by_call": {}})
+        body = record["request"].get("body") or {}
+        previous = body.get("previous_response_id") if record["protocol"] == "openai-responses" else None
+        delta_seen = self.delta_tool_seen.setdefault(stream, set())
+        context_counts, result_counts, response_counts = {}, {}, {}
+        calls, results = [], []
+        request_result_counts, result_call_keys = {}, {}
+        for event in record.get("tool_trace", []):
+            if event.get("event") == "tool_result":
+                key = _tool_identity(event)
+                request_result_counts[key] = request_result_counts.get(key, 0) + 1
+                result_call_keys[key] = _tool_identity({field: event.get(field) for field in
+                                                       ("tool_call_id", "tool_name", "arguments")})
+        # Reserve outstanding calls for results that are definitely new before
+        # considering an identical result from a shortened history window.
+        # Otherwise old X can consume the slot belonging to new Y, and inflate
+        # result counts enough to suppress a later genuine execution of X.
+        definite_by_call, replay_candidates = {}, {}
+        for key, number in request_result_counts.items():
+            call_key = result_call_keys[key]
+            old_count = counts["results"].get(key, 0)
+            definite_by_call[call_key] = definite_by_call.get(call_key, 0) + max(0, number - old_count)
+            replay_candidates[call_key] = replay_candidates.get(call_key, 0) + min(number, old_count)
+        uncertain_budget = {
+            key: min(number, max(0, counts["calls"].get(key, 0)
+                                 - counts["results_by_call"].get(key, 0)
+                                 - definite_by_call.get(key, 0)))
+            for key, number in replay_candidates.items()
+        }
+        emitted_results = {}
+
+        def emit(target, event, kind):
+            item = copy.deepcopy(event)
+            item["audit_event_id"] = f"{record['exchange_id']}:{kind}:{len(target)}"
+            target.append(item)
+
+        for event in record.get("tool_trace", []):
+            kind = event.get("event")
+            key = _tool_identity(event)
+            if kind == "tool_call":
+                emit(calls, event, "call")
+                response_counts[key] = response_counts.get(key, 0) + 1
+            elif kind in ("tool_call_context", "tool_result"):
+                is_call = kind == "tool_call_context"
+                uncertain = False
+                local = context_counts if is_call else result_counts
+                total = counts["calls" if is_call else "results"]
+                local[key] = local.get(key, 0) + 1
+                call_key = _tool_identity({field: event.get(field) for field in
+                                           ("tool_call_id", "tool_name", "arguments")})
+                if previous:
+                    # Responses input is a delta relative to this response, not
+                    # the same absolute history position in every request.
+                    occurrence = (previous, kind, key, local[key])
+                    fresh = occurrence not in delta_seen
+                    delta_seen.add(occurrence)
+                    if is_call and total.get(key, 0) >= local[key]:
+                        fresh = False  # Already captured in the prior response.
+                else:
+                    fresh = local[key] > total.get(key, 0)
+                    if not is_call and not fresh:
+                        # Prefer the last possible occurrences in a shortened
+                        # history while keeping their original output order.
+                        replay_candidates[call_key] -= 1
+                        fresh = replay_candidates[call_key] < uncertain_budget[call_key]
+                        uncertain = fresh
+                        if fresh:
+                            uncertain_budget[call_key] -= 1
+                if fresh:
+                    emit(calls if is_call else results, event, "context-call" if is_call else "result")
+                    if not is_call:
+                        emitted_results[key] = emitted_results.get(key, 0) + 1
+                        if uncertain:
+                            results[-1]["provenance_uncertain"] = True
+                        by_call = counts["results_by_call"]
+                        by_call[call_key] = by_call.get(call_key, 0) + 1
+        for key, number in context_counts.items():
+            counts["calls"][key] = max(counts["calls"].get(key, 0), number)
+        # Count exported occurrences, not only the longest observed history.
+        # Delta inputs and shortened windows can reveal more occurrences than
+        # any one request contains; a later full history must not repeat them.
+        for key, number in emitted_results.items():
+            counts["results"][key] = counts["results"].get(key, 0) + number
+        # Imported records may lack tool_trace. Match by occurrence within this
+        # response so that two identical calls are preserved, without exporting
+        # the same call once from trace and again from the assistant view.
+        assistant_counts = {}
+        for call in assistant.get("tool_calls", []):
+            event = {"event": "tool_call", "tool_call_id": call.get("id"), "tool_name": call.get("name"),
+                     "arguments": call.get("arguments"), "source": "assistant"}
+            key = _tool_identity(event)
+            assistant_counts[key] = assistant_counts.get(key, 0) + 1
+            if assistant_counts[key] > response_counts.get(key, 0):
+                emit(calls, event, "call")
+        for key in response_counts.keys() | assistant_counts.keys():
+            counts["calls"][key] = counts["calls"].get(key, 0) + max(
+                response_counts.get(key, 0), assistant_counts.get(key, 0))
+        return calls, results
+
     def _make_turn(self, record, frame, document_stream):
         messages = (record.get("chatml") or {}).get("messages", [])
         if (record.get("method") in ("GET", "HEAD", "OPTIONS") and not record.get("tool_trace")
@@ -640,6 +838,11 @@ class SessionJsonWriter:
         for index, message in enumerate(request_messages):
             message = _message_view(message)
             key = (index, _canon(message))
+            body = record["request"].get("body") or {}
+            if (record.get("readable_format_version", 1) >= 2 and record["protocol"] == "openai-responses"
+                    and body.get("previous_response_id")
+                    and message.get("role") not in ("system", "developer")):
+                key = (body["previous_response_id"], *key)
             if key in message_keys:
                 continue
             message_keys.add(key)
@@ -651,7 +854,8 @@ class SessionJsonWriter:
         if assistant:
             message_keys.add((len(request_messages), _canon(assistant)))
         calls, results = [], []
-        for event in record.get("tool_trace", []):
+        legacy = record.get("readable_format_version", 1) < 2
+        for event in record.get("tool_trace", []) if legacy else []:
             if event.get("event") in ("tool_call", "tool_call_context"):
                 key = _tool_identity(event)
                 if key not in call_keys:
@@ -663,13 +867,19 @@ class SessionJsonWriter:
                     result_keys.add(key)
                     results.append(copy.deepcopy(event))
         # Some imported records have assistant tool calls but no derived tool_trace.
-        for call in assistant.get("tool_calls", []):
+        for call in assistant.get("tool_calls", []) if legacy else []:
             event = {"event": "tool_call", "tool_call_id": call.get("id"), "tool_name": call.get("name"),
                      "arguments": call.get("arguments"), "source": "assistant"}
             key = _tool_identity(event)
             if key not in call_keys:
                 call_keys.add(key)
                 calls.append(event)
+        if legacy:
+            # Rebuild occurrence state from evidence, not the legacy view
+            # which may already have collapsed separate identical calls.
+            self._tool_events(record, assistant, stream)
+        else:
+            calls, results = self._tool_events(record, assistant, stream)
         response = record.get("response") or {}
         turn = {"sequence": frame["sequence"], "exchange_id": record["exchange_id"],
                 "response_id": frame.get("response_id"), "timestamp": record.get("ts"),
@@ -772,6 +982,7 @@ class SessionJsonWriter:
         if not record.get("request") or not record.get("protocol"):
             return None
         with self.lock, _session_file_lock(os.path.join(self.journal.directory, "readable-json.lock")):
+            record.setdefault("readable_format_version", 2)
             internal = self.journal.write(record)
             self._sync()
             document_stream = self.document_stream(record, record["stream_id"])
@@ -886,7 +1097,7 @@ def initial_context(protocol: str, body):
 
 
 def fallback_stream_id(protocol: str, body) -> str | None:
-    # Retained for backwards-compatible tool correlation; journal grouping uses CRC32.
+    # Legacy grouping hint only; authenticated session identities take priority.
     anchor = initial_context(protocol, body)
     if anchor is None:
         return None
@@ -1125,23 +1336,30 @@ class ToolTraceTracker:
                 history = [c for c in (context_calls or []) if call_id and c.get("id") == call_id
                            and c.get("position", -1) < result.get("position", float("inf"))]
                 context = history[-1] if history else None
-                candidates = [c for (s, cid, _), c in self._calls.items()
-                              if call_id and s == scope and cid == call_id]
+                candidate_items = [(key, c) for key, c in self._calls.items()
+                                   if call_id and key[0] == scope and key[1] == call_id]
                 if context is not None:
-                    candidates = [c for c in candidates if self._signature(c) == self._signature(context)]
+                    candidate_items = [(key, c) for key, c in candidate_items
+                                       if self._signature(c) == self._signature(context)]
                 elif previous_response_id:
-                    candidates = [c for c in candidates if c.get("response_id") == previous_response_id]
+                    candidate_items = [(key, c) for key, c in candidate_items
+                                       if c.get("response_id") == previous_response_id]
+                candidates = [c for _, c in candidate_items]
+                candidate_keys = frozenset(key for key, _ in candidate_items)
                 ambiguous = len(candidates) > 1
                 observed = candidates[0] if len(candidates) == 1 else None
                 call = context or observed or {}
                 fingerprint = hashlib.sha256(_canon([scope, call_id, self._signature(call),
-                                                     result.get("content"), result.get("is_error")]).encode()).hexdigest()
+                                                     result.get("content"), result.get("is_error"),
+                                                     (context or {}).get("source"), result.get("source"),
+                                                     previous_response_id]).encode()).hexdigest()
                 first = self._seen_results.get(fingerprint)
                 if first is None:
-                    self._seen_results[fingerprint] = exchange_id
+                    self._seen_results[fingerprint] = (exchange_id, candidate_keys)
                     self._trim(self._seen_results)
                 else:
                     self._seen_results.move_to_end(fingerprint)
+                replay_uncertain = first is not None and first[1] != candidate_keys
                 events.append({
                     "event": "tool_result",
                     "tool_call_id": call_id,
@@ -1150,12 +1368,14 @@ class ToolTraceTracker:
                     "arguments": _arguments(call.get("arguments")),
                     "call_exchange_id": (observed or {}).get("exchange_id"),
                     "call_response_id": (observed or {}).get("response_id"),
+                    "call_ordinal": (observed or {}).get("ordinal"),
                     "result_exchange_id": exchange_id,
                     "correlated": bool(context or observed),
                     "correlation_source": "request_context" if context else ("response_cache" if observed else "unmatched"),
                     "call_exchange_ambiguous": ambiguous,
-                    "replayed_context": first is not None,
-                    "first_result_exchange_id": first or exchange_id,
+                    "replayed_context": None if replay_uncertain else first is not None,
+                    "result_origin_ambiguous": replay_uncertain or ambiguous,
+                    "first_result_exchange_id": first[0] if first else exchange_id,
                     "is_error": result.get("is_error"),
                     "content": result.get("content"),
                     "source": result.get("source"),
@@ -1165,7 +1385,7 @@ class ToolTraceTracker:
     def observe_calls(self, exchange_id: str, calls: list[dict], scope: str | None = None, response_id=None) -> list[dict]:
         events = []
         with self._lock:
-            for call in calls:
+            for ordinal, call in enumerate(calls):
                 call_id = call.get("id")
                 event = {
                     "event": "tool_call",
@@ -1174,13 +1394,15 @@ class ToolTraceTracker:
                     "tool_kind_hint": tool_kind_hint(call.get("name")),
                     "call_exchange_id": exchange_id,
                     "call_response_id": response_id,
+                    "call_ordinal": ordinal,
                     "arguments": _arguments(call.get("arguments")),
                     "source": "response",
                     "correlated": False,
                 }
                 if call_id:
-                    key = (scope, call_id, exchange_id)
-                    self._calls[key] = {**call, "exchange_id": exchange_id, "response_id": response_id}
+                    key = (scope, call_id, exchange_id, ordinal)
+                    self._calls[key] = {**call, "exchange_id": exchange_id, "response_id": response_id,
+                                        "ordinal": ordinal}
                     self._calls.move_to_end(key)
                     self._trim(self._calls)
                 events.append(event)
@@ -1506,7 +1728,23 @@ class AuditHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             record["client_disconnect"] = True
         except socket.timeout:
-            record["error"] = "socket_timeout"
+            record.setdefault("error", "socket_timeout")
+            # A timed-out upstream must finish the client exchange too. Leaving
+            # HTTP/1.1 open here makes OMP wait for its own watchdog indefinitely.
+            try:
+                if not self.wfile.closed and not self._response_started:
+                    body = json.dumps({"error": record["error"]}).encode()
+                    self._response_started = True
+                    self.send_response(504)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    self.wfile.flush()
+            except OSError:
+                record["client_disconnect"] = True
+            self.close_connection = True
         except Exception as exc:  # 代理自身异常不能拖垮服务
             record["error"] = f"{type(exc).__name__}: {exc}"
             try:
@@ -1657,10 +1895,35 @@ class AuditHandler(BaseHTTPRequestHandler):
             body_json = json.loads(body) if body else None
         except (ValueError, TypeError):
             pass
+        if isinstance(body_json, dict) and "_omp_audit_v1" in body_json:
+            marker = body_json.pop("_omp_audit_v1")
+            session_id = marker.get("session_id") if isinstance(marker, dict) else None
+            agent_id = marker.get("agent_id") if isinstance(marker, dict) else None
+            signature = marker.get("signature") if isinstance(marker, dict) else None
+            valid_identity = all(isinstance(value, str) and 0 < len(value) <= 512 and "\0" not in value
+                                 for value in (session_id, agent_id))
+            valid_signature = (isinstance(signature, str) and len(signature) == 64
+                               and all(character in "0123456789abcdef" for character in signature))
+            expected = None
+            if self.control_token and valid_identity and valid_signature:
+                expected = hmac.new(self.control_token.encode("utf-8"),
+                                    (session_id + "\0" + agent_id).encode("utf-8"), hashlib.sha256).hexdigest()
+            if expected is None or not hmac.compare_digest(signature, expected):
+                # This is a private launcher field. Never forward a malformed
+                # marker or let an unauthenticated value control grouping.
+                record["error"] = "invalid_audit_identity"
+                self._control_reply(403, {"error": "invalid_audit_identity"})
+                return
+            record["audit_session_id"] = session_id
+            record["audit_agent_id"] = agent_id
+            body = json.dumps(body_json, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         conversation_key = fallback_stream_id(protocol, body_json) or "unkeyed"
         # Prompt hashes are grouping hints, not reliable unique session IDs.
         # Correlate by call identity + context; ambiguous origins stay unknown.
         trace_scope = route.prefix
+        if record.get("audit_session_id"):
+            identity_scope = _canon([record["audit_session_id"], record["audit_agent_id"]])
+            trace_scope += "session-" + hashlib.sha256(identity_scope.encode("utf-8")).hexdigest()
         record["conversation_hint"] = conversation_key
         record["tool_trace"] = TOOL_TRACE.observe_request(record["exchange_id"], protocol, body_json, trace_scope)
         record["tool_catalog"] = []
@@ -1730,17 +1993,19 @@ class AuditHandler(BaseHTTPRequestHandler):
         else:
             conn = http.client.HTTPConnection(route.host, route.port, timeout=self.upstream_connect_timeout)
 
-        conn.request(self.command, upstream_path, body=body, headers=headers)
         try:
+            conn.request(self.command, upstream_path, body=body, headers=headers)
+            # getresponse() detaches conn.sock for close-delimited responses;
+            # HTTPResponse still owns a file wrapper around this same socket.
+            upstream_socket = conn.sock
             resp = conn.getresponse()
         except socket.timeout:
             record["error"] = "upstream_connect_timeout"
             conn.close()
             raise
         # 响应开始后取消读超时（SSE 长流依赖 omp 端自己的 watchdog/abort）
-        # 无 Content-Length 的 close-delimited 响应会使 http.client 提前置空 sock
-        if conn.sock is not None:
-            conn.sock.settimeout(None)
+        if upstream_socket is not None:
+            upstream_socket.settimeout(None)
 
         record["response"] = {
             "status": resp.status,
@@ -1753,6 +2018,27 @@ class AuditHandler(BaseHTTPRequestHandler):
             v = resp.getheader(name)
             if v:
                 header_ids.append({"id": v, "source": f"header:{name}", "confidence": "high"})
+
+        if route.automatic and resp.status in (301, 302, 303, 307, 308):
+            # Native fetch follows redirects internally without re-entering the
+            # launcher wrapper. A 307/308 would also replay its original body,
+            # including the private identity marker, to an unaudited endpoint.
+            # Retain upstream status/headers as evidence, but never expose its
+            # Location to the automatic client. Explicit routes retain their
+            # existing redirect semantics for manually managed clients.
+            record["error"] = "upstream_redirect_blocked"
+            record["response"]["body_not_captured"] = "redirect_blocked"
+            payload = {"error": "upstream_redirect_blocked", "upstream_status": resp.status}
+            record["proxy_response"] = {"status": 502, "body": payload}
+            record["classification"] = classify_ids(header_ids, fallback_stream_id(protocol, body_json))
+            record["chatml"] = {"messages": derive_chatml_request(protocol, body_json)}
+            try:
+                resp.close()
+            finally:
+                conn.close()
+            self._response_started = True
+            self._control_reply(502, payload)
+            return
 
         # 回写响应头给客户端
         self._response_started = True
@@ -1991,7 +2277,7 @@ def main(argv=None) -> int:
     ap.add_argument("--log-backups", type=int, default=5)
     ap.add_argument("--tools-log", help="可选工具索引路径（--indexes 启用），默认与 --log 同目录下的 tools.jsonl")
     ap.add_argument("--sessions-dir", "--output-dir", dest="sessions_dir",
-                    help="可读 JSON 输出目录，文件按稳定响应链或 CRC32 命名为 session-*-rl.json")
+                    help="可读 JSON 输出目录，文件按稳定会话分组命名为 session-*-rl.json")
     ap.add_argument("--route", action="append", default=[],
                     help="上游路由 prefix=upstream 或 prefix=upstream=hint，可重复；仅代理模式至少配置一个")
     ap.add_argument("--upstream-connect-timeout", type=float, default=30.0)

@@ -268,6 +268,88 @@ def run_checks(directory_parent=None):
         checks.append(("readable_different_crc_groups_have_distinct_json_names", other_path != output
                        and len(list(growth_dir.glob("session-*-rl.json"))) == 2))
 
+        repeated_dir = root / "repeated-tools"
+        repeated = ap.SessionJsonWriter(str(repeated_dir))
+        prompt = [{"role": "user", "content": "run again"}]
+        first_call = exchange("repeat-1", prompt, "first", call=True)
+        repeated_path = Path(repeated.write(first_call))
+        repeated.write(exchange("repeat-2", prompt, "second", result=True))
+        repeated.write(exchange("repeat-3", prompt, "third", call=True))
+        repeated.write(exchange("repeat-4", prompt, "fourth", result=True))
+        repeated_turns = json.loads(repeated_path.read_text(encoding="utf-8"))["turns"]
+        checks.append(("readable_identical_calls_in_distinct_responses_are_preserved",
+                       len(repeated_turns[0]["tool_calls"]) == 1
+                       and len(repeated_turns[2]["tool_calls"]) == 1
+                       and repeated_turns[0]["tool_calls"][0]["audit_event_id"] !=
+                       repeated_turns[2]["tool_calls"][0]["audit_event_id"]))
+        checks.append(("readable_identical_results_after_new_call_are_preserved",
+                       len(repeated_turns[1]["tool_results"]) == 1
+                       and len(repeated_turns[3]["tool_results"]) == 1))
+        same_response = exchange("repeat-5", prompt, "fifth", call=True)
+        same_response["tool_trace"].append(copy.deepcopy(same_response["tool_trace"][0]))
+        same_response["chatml"]["messages"][-1]["tool_calls"].append(
+            copy.deepcopy(same_response["chatml"]["messages"][-1]["tool_calls"][0]))
+        repeated.write(same_response)
+        repeated_turns = json.loads(repeated_path.read_text(encoding="utf-8"))["turns"]
+        checks.append(("readable_identical_calls_within_one_response_are_preserved",
+                       len(repeated_turns[-1]["tool_calls"]) == 2))
+        before_replay = repeated_path.read_bytes()
+        ap.SessionJsonWriter(str(repeated_dir)).write(copy.deepcopy(same_response))
+        checks.append(("readable_repeated_tool_restart_is_idempotent",
+                       repeated_path.read_bytes() == before_replay))
+
+        history_writer = ap.SessionJsonWriter(str(root / "repeated-history"))
+        history_writer.write(exchange("hist-1", prompt, "one", call=True))
+        both = exchange("hist-2", prompt, "two", result=True)
+        both["tool_trace"].append(copy.deepcopy(first_call["tool_trace"][0]))
+        both["chatml"]["messages"][-1]["tool_calls"] = copy.deepcopy(
+            first_call["chatml"]["messages"][-1]["tool_calls"])
+        history_writer.write(both)
+        twice = exchange("hist-3", prompt, "three", result=True)
+        twice["tool_trace"] *= 2
+        history_path = Path(history_writer.write(twice))
+        history_turn = json.loads(history_path.read_text(encoding="utf-8"))["turns"][-1]
+        checks.append(("readable_new_tail_result_does_not_reexport_earlier_identical_result",
+                       len(history_turn["tool_results"]) == 1 and not history_turn["tool_calls"]))
+        replayed = copy.deepcopy(twice)
+        replayed["exchange_id"] = "hist-4"
+        history_writer.write(replayed)
+        history_turn = json.loads(history_path.read_text(encoding="utf-8"))["turns"][-1]
+        checks.append(("readable_full_repeated_history_keeps_no_extra_tools",
+                       not history_turn["tool_results"] and not history_turn["tool_calls"]))
+
+        delta_writer = ap.SessionJsonWriter(str(root / "response-deltas"))
+        for number, parent in enumerate(("resp_parent1", "resp_parent2", "resp_parent2")):
+            delta = exchange("delta-" + str(number), [], "reasoning", result=True)
+            delta.update(protocol="openai-responses", audit_session_id="delta-session")
+            delta["request"]["body"] = {"instructions": "DELTA_SYSTEM_SENTINEL" + "X" * 10000,
+                "previous_response_id": parent, "input": [
+                {"role": "user", "content": "again"},
+                {"type": "function_call_output", "call_id": "call1", "output": "same result"}]}
+            delta["tool_trace"] = [delta["tool_trace"][-1]]
+            delta["chatml"]["messages"] = ap.derive_chatml_request(delta["protocol"], delta["request"]["body"]) + [
+                {"role": "assistant", "content": "response"}]
+            delta_path = Path(delta_writer.write(delta))
+        delta_turns = json.loads(delta_path.read_text(encoding="utf-8"))["turns"]
+        checks.append(("readable_responses_delta_keeps_same_result_after_different_parent",
+                       [len(t["tool_results"]) for t in delta_turns] == [1, 1, 0]))
+        checks.append(("readable_responses_delta_keeps_identical_new_user_input",
+                       sum(m.get("content") == "again" for t in delta_turns for m in t["input_messages"]) == 2))
+        checks.append(("readable_responses_delta_does_not_repeat_fixed_instructions",
+                       delta_path.read_text(encoding="utf-8").count("DELTA_SYSTEM_SENTINEL") == 1))
+
+        legacy_writer = ap.SessionJsonWriter(str(root / "legacy"))
+        legacy = exchange("legacy-1", prompt, "legacy reasoning", call=True)
+        legacy_writer.journal.write(legacy)
+        legacy_writer._sync()
+        legacy_path = Path(legacy_writer.directory) / legacy_writer.filename(legacy["stream_id"])
+        old_bytes = legacy_path.read_bytes()
+        legacy_followup = exchange("legacy-2", prompt, "new reasoning", call=True)
+        ap.SessionJsonWriter(legacy_writer.directory).write(legacy_followup)
+        checks.append(("readable_new_event_format_preserves_legacy_turn_bytes",
+                       legacy_path.read_bytes().startswith(old_bytes[:-len(legacy_writer.FOOTER)])
+                       and len(json.loads(legacy_path.read_text(encoding="utf-8"))["turns"][-1]["tool_calls"]) == 1))
+
         concurrent = root / "concurrent"
         worker = ("import json,sys; from omp_audit_proxy import SessionJsonWriter; "
                   "w=SessionJsonWriter(sys.argv[1]); r=json.loads(sys.argv[2]); "

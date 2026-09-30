@@ -13,7 +13,7 @@ A local LLM API audit proxy for OMP built-in tools, MCP tools, and model context
 - 单文件 Python，纯标准库，仅监听 `127.0.0.1`。
 - 支持 Anthropic Messages、OpenAI-compatible Chat Completions 和 Responses 的 JSON / SSE 报文。
 - 记录请求、响应、API 返回的 thinking/reasoning、工具调用参数及后续上下文回传的结果。
-- 按稳定分组写可直接打开的 `session-<分组ID>-rl.json`，逐轮追加新对话、思考全文、工具参数和结果：优先按真实 response ID / previous_response_id 关联，ID 每轮变化且无法关联时按 system → 首条 user 的 CRC32 分组；SHA-256 校验锚点，避免 CRC32 碰撞误合并。请求 ID 不冒充响应 ID。
+- 按稳定分组写可直接打开的 `session-<分组ID>-rl.json`，逐轮追加新对话、思考全文、工具参数和结果。一键启动优先按 OMP 的 session/agent 身份隔离；手动接入无身份时使用 response ID / previous_response_id，最后降级到 system + 首条 user 的 CRC32 分组，并用 SHA-256 校验锚点。请求 ID 不冒充响应 ID。
 - 从请求历史恢复 OMP/MCP 工具名、参数和结果；重复历史会标记，无法确定的原始调用来源保留为空。
 - 不内置个人模型、上游地址、API Key 或 agent 配置。
 
@@ -82,7 +82,7 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 - `auxiliary/titles.json`：识别到的 OMP 自动标题请求统一追加到这一份辅助 JSON，不因重试、切换协议或标题上下文变化而在根目录新增文件；思考、输入和标题回复均保留，每轮含原始 `source_stream_id`。
 - `turns[].sse_complete`：是否捕获到 SSE 协议结束事件。客户端在结束事件后关闭连接仍记录 `client_disconnect`，但不再误标 `response_truncated_by`；此字段表示捕获完整，不保证客户端已收到每个字节。
 - `turns[].thinking`：该次响应中 API 实际返回的完整思考文本；没有返回时为 `null`，不会编造内容。
-- `turns[].tool_calls`：工具调用 ID、名称和完整 `arguments`；`turns[].tool_results`：工具名、参数、完整 `content` 及错误状态。
+- `turns[].tool_calls`：工具调用 ID、名称和完整 `arguments`；同参数的再次调用仍作为独立事件保留。`turns[].tool_results`：工具名、参数、完整 `content` 及错误状态。来源不确定时标 `provenance_uncertain` 或 `result_origin_ambiguous`。
 - `turns[].input_messages`：新增的 system/developer/user 消息；`recovered_messages` 保留尚未记录的历史助手消息和工具结果。
 - `.audit-state/`：内部增量证据和文件锁，用于恢复原始交换、重启去重及中断恢复。内部仍使用 JSONL 差分，不是要求用户查看的输出，也不每轮另存全量对话。
 
@@ -90,7 +90,7 @@ OMP 仍负责执行内置工具和调用 MCP；代理记录它们在模型请求
 
 CRC32 只取 system 与首条 user 的实际内容，忽略内容块上的 `cache_control` 缓存元数据；缓存标记增加、移除或移动不会创建新分组，原始请求仍完整保留。已识别的 OMP 自动标题请求统一归入 `auxiliary/titles.json`，主目录只输出主对话分组；多个独立主对话仍各自保留文件。标题识别要求 system 匹配 OMP 标题模板，且不包含工具定义或工具事件；普通用户要求写标题不会被移出主对话。GET/HEAD/OPTIONS 等请求若不含对话、思考或工具事件（例如 `GET /usages` 额度查询），只保存在内部审计证据中，不再生成空会话 JSON。
 
-优先通过真实 response ID / previous_response_id 关联已有分组；无法关联时使用 system + 首条 user 的 CRC32，例如 `session-crc32-1a2b3c4d-rl.json`。已有响应链沿用原文件，无初始上下文时使用带 response ID 的文件名。每轮新 response ID 不会强制新建文件。SHA-256 校验锚点，防止 CRC32 碰撞误合并；相同初始上下文仍只是分组线索，不是独立运行/分支的严格身份。请求 ID 不冒充响应 ID。
+一键启动优先按 OMP 当前 session ID、agent ID、上游及协议隔离，两个独立会话即使 system 和首条 user 完全相同也不会合并；同一会话切换上游或协议会生成另一份 JSON。手动接入或未带可信身份的辅助请求才通过真实 response ID / previous_response_id 关联，无法关联时使用 system + 首条 user 的 CRC32，例如 `session-crc32-1a2b3c4d-rl.json`。SHA-256 校验锚点，防止 CRC32 碰撞误合并；无身份时相同初始上下文仍只是分组线索。请求 ID 不冒充响应 ID。
 
 直接读取用户可见 JSON：
 
@@ -132,13 +132,16 @@ python -B -X utf8 test_readable_json.py
 
 ### 隐私与限制
 
-- 自动路由只覆盖上述三类 API，且要求同一 provider 的聊天模型使用同一上游地址和 API。其他或混合端点 provider 会明确提示未覆盖；启动时所选模型无法安全路由则停止，不会悄悄直接调用。运行中切换到未覆盖的 provider 不会自动获得审计覆盖。
+- 自动路由覆盖上述三类 API。启动时预登记统一端点的 provider；运行中切换 provider、API 或上游端点时，在下一轮请求前按当前模型动态登记。混合端点 provider 可按实际选中模型接入；不支持的 API、旧审计地址或登记失败会停止此次 OMP，避免漏审计直连。
+- 自动路由遇到上游 HTTP 重定向时返回 `502 upstream_redirect_blocked`，避免客户端自动跟随而绕过审计。请将 provider 配置为最终模型端点。
+- 一键模式通过临时扩展为请求添加经过 HMAC 验证的 session/agent 标记。代理验证后立即剥离，标记和签名不会发给模型上游；主会话与 vibe 等子代理使用各自 session ID，工具调用关联也按 session/agent 隔离。手动接入及未经过扩展 hook 的辅助请求仍使用保守分组。
 - 自动接入作用于此次 OMP 进程的全局 fetch。自定义独立传输、提前保存的原始 fetch 或 WebSocket 不保证覆盖，需显式接入代理。
 - 只对指定认证头、Cookie 和敏感查询参数脱敏。**正文中的密码、源码、Flag、文件路径、工具输出等仍可能原样出现，分享前必须审查。**
 - `.gitignore` 排除日志、缓存和常见本地配置，但不能清除已经提交的文件或 Git 历史。
 - 使用正常的 TLS 证书校验，仅允许回环绑定；回环绑定不能阻止其他本机进程访问。
 - 日志尝试设置 POSIX `0600` 权限；Windows 需另外配置文件系统 ACL。
 - 工具结果要等客户端在后续模型请求中回传后才能记录；未回传的本地执行细节不在 HTTP 审计范围内。只记录 API 实际返回的推理内容。
+- 上游流静默期间，客户端取消可能要等后续读取或写入才被发现；该次交换的审计记录可能延迟落盘，强制结束代理存在丢失风险。
 - ChatML 是有损派生视图；SSE 事件经过 JSON 解析，不是逐字节取证副本。
 - 不支持 WebSocket 审计或压缩请求体解码。压缩请求以 base64 保留；需要结构化审计时，在客户端关闭请求压缩。向上游发送 `Accept-Encoding: identity`。
 - 正文和 SSE 事件日志有截断阈值；检查截断、断连标记，不应视为无限量、不可丢失的归档。
@@ -150,7 +153,7 @@ python -B -X utf8 test_readable_json.py
 - One Python file, standard library only, bound to `127.0.0.1`.
 - JSON and SSE handling for Anthropic Messages, OpenAI-compatible Chat Completions, and Responses.
 - Captures requests, responses, API-exposed thinking/reasoning, tool arguments, and results returned in subsequent model context.
-- Writes one directly readable `session-<group-id>-rl.json` per stable group, appending new turns with full thinking and tool payloads. Link by actual response ID / previous_response_id; when IDs change without a link, group by CRC32 of system through first user, checking SHA-256 to separate CRC32 collisions. Request IDs are never used as response IDs.
+- Writes one directly readable `session-<group-id>-rl.json` per stable group, appending new turns with full thinking and tool payloads. The launcher isolates OMP session/agent identities. Untagged manual requests fall back to response ID / previous_response_id, then CRC32 of system and first user with SHA-256 collision checks. Request IDs are never used as response IDs.
 - Recovers OMP/MCP tool names, arguments, and results from request history, including after a proxy restart. Repeated context is marked; ambiguous origins are not guessed.
 - No personal models, upstream endpoints, API keys, or agent configuration are bundled.
 
@@ -219,7 +222,7 @@ Launcher output defaults to `audit-logs/<run-id>/` beside the script. The Window
 - `auxiliary/titles.json` collects recognized OMP automatic-title requests in one incremental auxiliary document. Retries, protocol changes and updated title context do not create new root-level files. Thinking, inputs and title replies remain visible, with a `source_stream_id` on each turn.
 - `turns[].sse_complete` reports whether the SSE protocol terminal event was captured. A client disconnect after completion remains recorded, without a false `response_truncated_by` marker. This describes capture completeness, not guaranteed byte delivery to the client.
 - `turns[].thinking` contains the complete reasoning text actually exposed by that response; absent reasoning is `null` and is never invented.
-- `turns[].tool_calls` contains call IDs, tool names and complete `arguments`. `turns[].tool_results` contains names, arguments, full result `content` and error status.
+- `turns[].tool_calls` contains call IDs, tool names and complete `arguments`; distinct response occurrences remain separate even with identical arguments. `turns[].tool_results` contains names, arguments, full result `content` and error status. Uncertain origins are marked `provenance_uncertain` or `result_origin_ambiguous`.
 - `turns[].input_messages` contains new system/developer/user messages; `recovered_messages` retains previously unseen assistant history and tool results.
 - `.audit-state/` holds internal incremental evidence and locks for exact exchange recovery, restart deduplication and crash repair. It uses JSONL deltas internally, without storing a full conversation snapshot on every turn.
 
@@ -227,7 +230,7 @@ Each group has one JSON document. Only new content and unique tool events are ap
 
 CRC32 uses system and first-user content, ignoring `cache_control` metadata on content blocks. Adding, removing or moving cache hints does not create a new group; raw requests remain intact. Recognized automatic-title requests share `auxiliary/titles.json`; the root directory contains main-conversation groups. Independent main conversations still have separate files. Detection requires the OMP title-system template with no tool definitions or events; an ordinary user request to write a title stays in the main conversation. GET/HEAD/OPTIONS requests without conversation content, reasoning or tool events (such as `GET /usages` quota checks) remain in internal evidence without generating empty conversation JSON files.
 
-Known response IDs or previous_response_id link existing groups; otherwise the system and first user form a CRC32 anchor, e.g. `session-crc32-1a2b3c4d-rl.json`. Linked responses keep their original group file; without initial context the filename contains the response ID. A fresh response ID alone does not force a new file. SHA-256 disambiguates CRC32 collisions. Identical initial prompts remain grouping hints, not strict independent-session or branch identities. Request IDs are never treated as response IDs.
+The launcher groups by OMP session ID, agent ID, upstream and protocol. Independent sessions with identical initial prompts stay separate; changing upstream or protocol creates another JSON document. Untagged manual or auxiliary requests use response ID / previous_response_id, then a CRC32 anchor from system and first user, e.g. `session-crc32-1a2b3c4d-rl.json`. SHA-256 disambiguates CRC32 collisions. Without an authenticated session identity, identical initial prompts remain grouping hints. Request IDs are never treated as response IDs.
 
 Read the public output directly:
 
@@ -267,13 +270,16 @@ Tests use local synthetic fixtures. `--real-omp` additionally drives installed O
 
 ### Privacy and limitations
 
-- Automatic routing covers the three APIs above and requires a uniform chat-model endpoint and API within each provider. Unsupported or mixed-endpoint providers are reported as uncovered. An unsupported selection at startup stops the child instead of silently calling it directly. Switching to an uncovered provider later does not automatically add audit coverage.
+- Automatic routing covers the three APIs above. Uniform provider endpoints are registered at startup; switching provider, API, or upstream endpoint registers the selected model before the next turn. Mixed-endpoint providers can be routed using the actual selected model. Unsupported APIs, stale audit URLs, and registration failures stop this OMP process to avoid unaudited direct requests.
+- Automatic routes return `502 upstream_redirect_blocked` for upstream HTTP redirects to prevent the client following them outside the audit proxy. Configure the provider with its final model endpoint.
+- The temporary extension attaches an HMAC-authenticated session/agent marker. The proxy validates and removes it before forwarding, so neither the marker nor its signature reaches the model upstream. Main and vibe/subagent sessions use their own session IDs, and tool-call correlation is also isolated by session and agent. Manual connections and auxiliary requests without the extension hook retain conservative grouping.
 - Automatic interception uses this OMP process's global fetch. Independent custom transports, previously captured fetch functions and WebSockets are not guaranteed to be covered; use an explicit proxy connection for those clients.
 - Selected authentication headers, cookies, and sensitive query parameters are redacted. **Bodies may still contain passwords, source code, flags, paths, and tool output. Review logs before sharing.**
 - `.gitignore` excludes logs, caches, and common local configuration; it cannot erase tracked files or existing Git history.
 - Normal TLS certificate verification is used and non-loopback binding is refused. Loopback binding is not access control against other local processes.
 - Log files attempt POSIX mode `0600`; configure filesystem ACLs separately on Windows.
 - Tool results are visible only after the client sends them back in model context. Local-only execution details are outside HTTP auditing. Only reasoning actually exposed by the API is recorded.
+- While an upstream stream is idle, client cancellation may only be detected on a later read or write. The exchange can remain unwritten until then, and forcibly stopping the proxy can lose it.
 - ChatML is a lossy view; SSE events are parsed, not byte-for-byte forensic copies.
 - WebSocket auditing and compressed-request decoding are unsupported. Compressed requests are retained as base64; disable client request compression for structured capture. Upstream requests use `Accept-Encoding: identity`.
 - Body and SSE event logs have truncation thresholds. Check truncation/disconnect markers; do not assume unlimited or lossless archival.
